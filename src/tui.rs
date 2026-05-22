@@ -352,6 +352,9 @@ impl App {
                 self.show_help = true;
                 self.message = "Help".to_string();
             }
+            "q" | "quit" => {
+                self.should_quit = true;
+            }
             _ => {
                 self.message = format!("Unknown command: :{command}");
             }
