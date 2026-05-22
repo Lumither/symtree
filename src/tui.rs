@@ -22,6 +22,7 @@ use self::watcher::{SYMBOL_RELOAD_DEBOUNCE, fs_event_should_trigger_reload, relo
 
 use crate::{
     error::{AppContext, AppResult},
+    languages::{LanguageDef, lsp_program},
     lsp::load_project_symbols,
     model::ProjectSymbols,
     tree::{
@@ -35,16 +36,24 @@ pub enum GlyphMode {
     Ascii,
 }
 
+fn compose_load_message(prefix: &str, warnings: &[String]) -> String {
+    match warnings.len() {
+        0 => prefix.to_string(),
+        1 => format!("{prefix} — ! {}", warnings[0]),
+        n => format!("{prefix} — ! {} (+{} more)", warnings[0], n - 1),
+    }
+}
+
 pub fn run(
     root: PathBuf,
-    lsp_command: String,
+    languages: Vec<LanguageDef>,
     glyph_mode: GlyphMode,
     symbols: ProjectSymbols,
 ) -> AppResult<()> {
     let mut terminal = ratatui::try_init().context("failed to initialize terminal")?;
     let result = run_app(
         &mut terminal,
-        App::new(root, lsp_command, glyph_mode, symbols),
+        App::new(root, languages, glyph_mode, symbols),
     );
     ratatui::restore();
     result
@@ -52,7 +61,7 @@ pub fn run(
 
 struct App {
     root: PathBuf,
-    lsp_command: String,
+    languages: Vec<LanguageDef>,
     project: ProjectSymbols,
     selected: usize,
     list_state: ListState,
@@ -62,6 +71,8 @@ struct App {
     message: String,
     glyph_mode: GlyphMode,
     show_help: bool,
+    show_warnings: bool,
+    show_lsp: bool,
     should_quit: bool,
     preview_cache: Option<PreviewCache>,
     preview_request_tx: Sender<PreviewRequest>,
@@ -82,7 +93,7 @@ struct App {
 impl App {
     fn new(
         root: PathBuf,
-        lsp_command: String,
+        languages: Vec<LanguageDef>,
         glyph_mode: GlyphMode,
         project: ProjectSymbols,
     ) -> Self {
@@ -94,8 +105,8 @@ impl App {
         let (reload_result_tx, reload_result_rx) = mpsc::channel::<AppResult<ProjectSymbols>>();
         {
             let root = root.clone();
-            let lsp = lsp_command.clone();
-            thread::spawn(move || reload_worker(root, lsp, reload_request_rx, reload_result_tx));
+            let langs = languages.clone();
+            thread::spawn(move || reload_worker(root, langs, reload_request_rx, reload_result_tx));
         }
 
         let (fs_event_tx, fs_event_rx) = mpsc::channel::<notify::Result<notify::Event>>();
@@ -110,7 +121,7 @@ impl App {
 
         let mut app = Self {
             root,
-            lsp_command,
+            languages,
             project,
             selected: 0,
             list_state: ListState::default(),
@@ -120,6 +131,8 @@ impl App {
             message: String::new(),
             glyph_mode,
             show_help: false,
+            show_warnings: false,
+            show_lsp: false,
             should_quit: false,
             preview_cache: None,
             preview_request_tx: request_tx,
@@ -137,7 +150,14 @@ impl App {
             center_selection_pending: false,
         };
         app.refresh_watched_files();
+        if !app.project.warnings.is_empty() {
+            app.set_load_message("Loaded");
+        }
         app
+    }
+
+    fn set_load_message(&mut self, prefix: &str) {
+        self.message = compose_load_message(prefix, &self.project.warnings);
     }
 
     fn refresh_watched_files(&mut self) {
@@ -185,6 +205,28 @@ impl App {
             match key.code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
                     self.show_help = false;
+                    self.message.clear();
+                }
+                _ => {}
+            }
+            return Ok(Action::None);
+        }
+
+        if self.show_warnings {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                    self.show_warnings = false;
+                    self.message.clear();
+                }
+                _ => {}
+            }
+            return Ok(Action::None);
+        }
+
+        if self.show_lsp {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                    self.show_lsp = false;
                     self.message.clear();
                 }
                 _ => {}
@@ -351,6 +393,18 @@ impl App {
             "help" => {
                 self.show_help = true;
                 self.message = "Help".to_string();
+            }
+            "warnings" | "w" => {
+                if self.project.warnings.is_empty() {
+                    self.message = "No warnings".to_string();
+                } else {
+                    self.show_warnings = true;
+                    self.message.clear();
+                }
+            }
+            "lsp" => {
+                self.show_lsp = true;
+                self.message.clear();
             }
             "q" | "quit" => {
                 self.should_quit = true;
@@ -594,7 +648,7 @@ fn run_app(terminal: &mut DefaultTerminal, mut app: App) -> AppResult<()> {
                     app.preview_cache = None;
                     app.preview_in_flight = None;
                     app.loading_overlay_shown = false;
-                    app.message = "Symbols synced".to_string();
+                    app.set_load_message("Symbols synced");
                 }
                 Err(err) => {
                     app.message = format!("Sync failed: {err}");
@@ -669,19 +723,23 @@ fn run_app(terminal: &mut DefaultTerminal, mut app: App) -> AppResult<()> {
 fn reload_symbols(terminal: &mut DefaultTerminal, app: &mut App) -> AppResult<()> {
     let previous_path = app.selected_path();
     let previous_row = app.selected;
-    app.message = format!("Reloading through {}", app.lsp_command);
+    app.message = if app.languages.len() == 1 {
+        format!("Reloading through {}", lsp_program(&app.languages[0].lsp))
+    } else {
+        format!("Reloading {} languages…", app.languages.len())
+    };
     terminal
         .draw(|frame| render(frame, app))
         .context("failed to render reload frame")?;
 
-    match load_project_symbols(&app.root, &app.lsp_command) {
+    match load_project_symbols(&app.root, &app.languages) {
         Ok(project) => {
             app.project = project;
             app.refresh_watched_files();
             app.preview_cache = None;
             app.preview_in_flight = None;
             app.restore_selection(previous_path.as_deref(), previous_row);
-            app.message = "Reloaded symbols".to_string();
+            app.set_load_message("Reloaded symbols");
         }
         Err(error) => {
             app.message = format!("Reload failed: {error}");
@@ -996,7 +1054,11 @@ mod tests {
     fn sample_app() -> App {
         App::new(
             PathBuf::from("/workspace"),
-            "rust-analyzer".to_string(),
+            vec![LanguageDef {
+                lsp: "rust-analyzer".to_string(),
+                extensions: vec!["rs".to_string()],
+                language_id: Some("rust".to_string()),
+            }],
             GlyphMode::Unicode,
             ProjectSymbols {
                 root: PathBuf::from("/workspace"),

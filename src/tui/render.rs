@@ -35,6 +35,10 @@ pub(super) fn render(frame: &mut Frame, app: &mut App) {
 
     if app.show_help {
         render_help(frame, app, area);
+    } else if app.show_warnings {
+        render_warnings(frame, app, area);
+    } else if app.show_lsp {
+        render_lsp(frame, app, area);
     }
 }
 
@@ -117,12 +121,7 @@ pub(super) fn preferred_details_height(app: &App, max: u16) -> u16 {
     } else {
         1
     };
-    let warning_lines = if app.project.warnings.is_empty() {
-        0
-    } else {
-        2 + app.project.warnings.iter().take(5).count()
-    };
-    let target = (detail_lines + warning_lines + 2) as u16;
+    let target = (detail_lines + 2) as u16;
     let upper = max.saturating_sub(5).max(6);
     target.clamp(6, upper.max(6))
 }
@@ -247,20 +246,6 @@ pub(super) fn render_details(frame: &mut Frame, app: &App, area: Rect) {
             "No symbol selected",
             Style::default().fg(Color::DarkGray),
         )));
-    }
-
-    if !app.project.warnings.is_empty() {
-        lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(
-            "Warnings",
-            Style::default().fg(Color::Red).bold(),
-        )));
-        for warning in app.project.warnings.iter().take(5) {
-            lines.push(Line::from(vec![
-                Span::styled("! ", Style::default().fg(Color::Red)),
-                Span::styled(warning.clone(), Style::default().fg(Color::Gray)),
-            ]));
-        }
     }
 
     frame.render_widget(
@@ -535,6 +520,122 @@ pub(super) fn truncate_left(text: &str, max_width: usize) -> String {
     tail.reverse();
     format!("~{}", tail.into_iter().collect::<String>())
 }
+pub(super) fn render_warnings(frame: &mut Frame, app: &App, area: Rect) {
+    let popup = centered_rect(area, 80, area.height.saturating_sub(4));
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if app.project.warnings.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No warnings",
+            Style::default().fg(Color::Gray),
+        )));
+    } else {
+        for warning in &app.project.warnings {
+            lines.push(Line::from(vec![
+                Span::styled("! ", Style::default().fg(Color::Red).bold()),
+                Span::styled(warning.clone(), Style::default().fg(Color::Gray)),
+            ]));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Esc / Enter / q      close",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(format!(" Warnings ({}) ", app.project.warnings.len()))
+                    .borders(Borders::ALL)
+                    .border_set(border_set(app.glyph_mode)),
+            )
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+pub(super) fn render_lsp(frame: &mut Frame, app: &App, area: Rect) {
+    let popup = centered_rect(area, 80, area.height.saturating_sub(4));
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    lines.push(Line::from(Span::styled(
+        "Configured languages",
+        Style::default().fg(Color::Cyan).bold(),
+    )));
+    lines.push(Line::raw(""));
+
+    let mut entries: Vec<(u8, &str, Color, &crate::languages::LanguageDef, usize)> = app
+        .languages
+        .iter()
+        .map(|lang| {
+            let installed = crate::lsp::lsp_is_available(&lang.lsp);
+            let files_seen = app
+                .project
+                .files
+                .iter()
+                .filter(|f| {
+                    std::path::Path::new(&f.name)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| lang.extensions.iter().any(|x| x == e))
+                })
+                .count();
+            let (rank, label, color) = if installed && files_seen > 0 {
+                (0u8, "active", Color::Green)
+            } else if installed {
+                (1u8, "idle", Color::DarkGray)
+            } else {
+                (2u8, "missing", Color::DarkGray)
+            };
+            (rank, label, color, lang, files_seen)
+        })
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.3.lsp.cmp(&b.3.lsp)));
+
+    for (_, status_text, status_color, lang, files_seen) in entries {
+        let program = crate::languages::lsp_program(&lang.lsp);
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {:<14}", program),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(
+                format!("{:>4} files  ", files_seen),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled(
+                format!("[{status_text}]"),
+                Style::default().fg(status_color).bold(),
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!("    ext: {}", lang.extensions.join(", ")),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Esc / Enter / q      close",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(format!(" LSP ({}) ", app.languages.len()))
+                    .borders(Borders::ALL)
+                    .border_set(border_set(app.glyph_mode)),
+            )
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
 pub(super) fn render_help(frame: &mut Frame, app: &App, area: Rect) {
     let popup = centered_rect(area, 70, 15);
     let lines = vec![
@@ -554,9 +655,11 @@ pub(super) fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         Line::from("  Enter/Space        toggle branch"),
         Line::from("  /                  filter symbols"),
         Line::from("  :help              show this help"),
+        Line::from("  :warnings          list load warnings"),
+        Line::from("  :lsp               list LSP languages"),
         Line::from("  o                  open selected in $EDITOR"),
         Line::from("  r                  reload symbols"),
-        Line::from("  q                  quit"),
+        Line::from("  q  /  :q           quit"),
         Line::from(""),
         Line::from(Span::styled(
             "Esc / Enter / q      close",

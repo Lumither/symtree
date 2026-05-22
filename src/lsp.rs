@@ -1,6 +1,6 @@
 use std::{
     io::{BufRead, BufReader, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
 };
 
@@ -8,13 +8,52 @@ use serde_json::{Value, json};
 
 use crate::{
     error::{AppContext, AppResult, app_error},
+    languages::{LanguageDef, lsp_program},
     model::{ProjectSymbols, SymbolKind, SymbolNode},
-    project::collect_rust_files,
+    project::collect_source_files,
 };
 
-pub fn load_project_symbols(root: &Path, lsp_command: &str) -> AppResult<ProjectSymbols> {
-    let rust_files = collect_rust_files(root)?;
-    if rust_files.is_empty() {
+pub fn load_project_symbols(root: &Path, languages: &[LanguageDef]) -> AppResult<ProjectSymbols> {
+    let mut files = Vec::new();
+    let mut warnings = Vec::new();
+    let probing_registry = languages.len() > 1;
+
+    for lang in languages {
+        if probing_registry && !lsp_is_available(&lang.lsp) {
+            continue;
+        }
+        match load_symbols_for_language(root, lang) {
+            Ok(mut partial) => {
+                files.append(&mut partial.files);
+                warnings.append(&mut partial.warnings);
+            }
+            Err(error) => {
+                warnings.push(format!("{}: {error}", lsp_program(&lang.lsp)));
+            }
+        }
+    }
+
+    Ok(ProjectSymbols {
+        root: root.to_path_buf(),
+        files,
+        warnings,
+    })
+}
+
+pub fn lsp_is_available(command: &str) -> bool {
+    let program = command.split_whitespace().next().unwrap_or(command);
+    if program.contains(std::path::MAIN_SEPARATOR) {
+        return Path::new(program).is_file();
+    }
+    lsp_search_path()
+        .split(':')
+        .filter(|p| !p.is_empty())
+        .any(|dir| Path::new(dir).join(program).is_file())
+}
+
+fn load_symbols_for_language(root: &Path, lang: &LanguageDef) -> AppResult<ProjectSymbols> {
+    let source_files = collect_source_files(root, &lang.extensions)?;
+    if source_files.is_empty() {
         return Ok(ProjectSymbols {
             root: root.to_path_buf(),
             files: Vec::new(),
@@ -29,13 +68,14 @@ pub fn load_project_symbols(root: &Path, lsp_command: &str) -> AppResult<Project
         .unwrap_or("workspace")
         .to_string();
 
-    let mut client = LspClient::spawn(lsp_command, root_uri.clone(), root_name.clone())?;
+    let mut client = LspClient::spawn(&lang.lsp, root_uri.clone(), root_name.clone())?;
     client.initialize(root, &root_uri, &root_name)?;
 
+    let language_id = lang.language_id.as_deref().unwrap_or("plaintext");
     let mut files = Vec::new();
     let mut warnings = Vec::new();
 
-    for file in rust_files {
+    for file in source_files {
         let relative_name = relative_path(root, &file);
         let text = match std::fs::read_to_string(&file) {
             Ok(text) => text,
@@ -46,7 +86,7 @@ pub fn load_project_symbols(root: &Path, lsp_command: &str) -> AppResult<Project
         };
 
         let uri = file_uri(&file);
-        if let Err(error) = client.did_open(&uri, &text) {
+        if let Err(error) = client.did_open(&uri, &text, language_id) {
             warnings.push(format!("{relative_name}: failed to open in LSP: {error}"));
             continue;
         }
@@ -79,7 +119,13 @@ struct LspClient {
 
 impl LspClient {
     fn spawn(command: &str, root_uri: String, root_name: String) -> AppResult<Self> {
-        let mut child = Command::new(command)
+        let mut parts = command.split_whitespace();
+        let program = parts.next().ok_or_else(|| app_error("empty LSP command"))?;
+        let args: Vec<&str> = parts.collect();
+        let resolved = resolve_lsp_command(program);
+        let mut child = Command::new(&resolved)
+            .args(&args)
+            .env("PATH", lsp_search_path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -136,13 +182,13 @@ impl LspClient {
         self.notify("initialized", json!({}))
     }
 
-    fn did_open(&mut self, uri: &str, text: &str) -> AppResult<()> {
+    fn did_open(&mut self, uri: &str, text: &str, language_id: &str) -> AppResult<()> {
         self.notify(
             "textDocument/didOpen",
             json!({
                 "textDocument": {
                     "uri": uri,
-                    "languageId": "rust",
+                    "languageId": language_id,
                     "version": 1,
                     "text": text
                 }
@@ -392,6 +438,30 @@ fn normalize_path(path: &Path) -> String {
         format!("/{path}")
     } else {
         path
+    }
+}
+
+fn resolve_lsp_command(command: &str) -> PathBuf {
+    if command.contains(std::path::MAIN_SEPARATOR) {
+        return PathBuf::from(command);
+    }
+    let search_path = lsp_search_path();
+    for dir in search_path.split(':').filter(|p| !p.is_empty()) {
+        let candidate = Path::new(dir).join(command);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from(command)
+}
+
+fn lsp_search_path() -> String {
+    let extra = std::env::var("LSP_SEARCH_PATH").ok();
+    let base = std::env::var("PATH").unwrap_or_default();
+    match extra {
+        Some(e) if !e.is_empty() && !base.is_empty() => format!("{e}:{base}"),
+        Some(e) if !e.is_empty() => e,
+        _ => base,
     }
 }
 

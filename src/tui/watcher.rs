@@ -7,19 +7,21 @@ use std::{
 
 use notify::EventKind;
 
-use crate::{error::AppResult, lsp::load_project_symbols, model::ProjectSymbols};
+use crate::{
+    error::AppResult, languages::LanguageDef, lsp::load_project_symbols, model::ProjectSymbols,
+};
 
 pub(super) const SYMBOL_RELOAD_DEBOUNCE: Duration = Duration::from_millis(300);
 
 pub(super) fn reload_worker(
     root: PathBuf,
-    lsp_command: String,
+    languages: Vec<LanguageDef>,
     rx: Receiver<()>,
     tx: Sender<AppResult<ProjectSymbols>>,
 ) {
     while rx.recv().is_ok() {
         while rx.try_recv().is_ok() {}
-        let result = load_project_symbols(&root, &lsp_command);
+        let result = load_project_symbols(&root, &languages);
         if tx.send(result).is_err() {
             break;
         }

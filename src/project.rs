@@ -5,14 +5,14 @@ use std::{
 
 use crate::error::{AppContext, AppResult};
 
-pub fn collect_rust_files(root: &Path) -> AppResult<Vec<PathBuf>> {
+pub fn collect_source_files(root: &Path, extensions: &[String]) -> AppResult<Vec<PathBuf>> {
     let mut files = Vec::new();
-    visit_dir(root, &mut files)?;
+    visit_dir(root, extensions, &mut files)?;
     files.sort();
     Ok(files)
 }
 
-fn visit_dir(path: &Path, files: &mut Vec<PathBuf>) -> AppResult<()> {
+fn visit_dir(path: &Path, extensions: &[String], files: &mut Vec<PathBuf>) -> AppResult<()> {
     for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
         let entry = entry.with_context(|| format!("failed to read entry in {}", path.display()))?;
         let path = entry.path();
@@ -24,8 +24,13 @@ fn visit_dir(path: &Path, files: &mut Vec<PathBuf>) -> AppResult<()> {
             if should_skip_dir(&path) {
                 continue;
             }
-            visit_dir(&path, files)?;
-        } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+            visit_dir(&path, extensions, files)?;
+        } else if file_type.is_file()
+            && path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| extensions.iter().any(|target| target == ext))
+        {
             files.push(path);
         }
     }
@@ -37,6 +42,17 @@ fn should_skip_dir(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-
-    name == ".git" || name == "target"
+    matches!(
+        name,
+        ".git"
+            | "target"
+            | "node_modules"
+            | ".venv"
+            | "__pycache__"
+            | ".idea"
+            | "dist"
+            | "build"
+            | ".next"
+            | ".cache"
+    )
 }
