@@ -16,6 +16,8 @@ use crate::{
 use super::preview::{build_preview_lines, viewport_range};
 use super::{App, GlyphMode, LOADING_INDICATOR_DELAY, Mode, PreviewRequest};
 
+const SCROLLOFF: usize = 5;
+
 pub(super) fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     if area.width < 40 || area.height < 8 {
@@ -154,6 +156,27 @@ pub(super) fn render_tree(frame: &mut Frame, app: &mut App, area: Rect) {
 
     app.list_state
         .select((!visible.is_empty()).then_some(app.selected));
+
+    let inner_height = area.height.saturating_sub(2) as usize;
+    if !visible.is_empty() && inner_height > 0 {
+        let max_offset = visible.len().saturating_sub(inner_height);
+        if app.center_selection_pending {
+            let offset = app
+                .selected
+                .saturating_sub(inner_height / 2)
+                .min(max_offset);
+            *app.list_state.offset_mut() = offset;
+            app.center_selection_pending = false;
+        } else {
+            let scrolloff = SCROLLOFF.min(inner_height.saturating_sub(1) / 2);
+            let lower = (app.selected + scrolloff + 1).saturating_sub(inner_height);
+            let upper = app.selected.saturating_sub(scrolloff);
+            let current = app.list_state.offset();
+            let clamped = current.max(lower).min(upper).min(max_offset);
+            *app.list_state.offset_mut() = clamped;
+        }
+    }
+
     frame.render_stateful_widget(list, area, &mut app.list_state);
 }
 

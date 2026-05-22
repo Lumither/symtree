@@ -76,6 +76,7 @@ struct App {
     reload_result_rx: Receiver<AppResult<ProjectSymbols>>,
     reload_in_flight: bool,
     watched_files: HashSet<PathBuf>,
+    center_selection_pending: bool,
 }
 
 impl App {
@@ -133,6 +134,7 @@ impl App {
             reload_result_rx,
             reload_in_flight: false,
             watched_files: HashSet::new(),
+            center_selection_pending: false,
         };
         app.refresh_watched_files();
         app
@@ -194,8 +196,11 @@ impl App {
             KeyCode::Char('q') => Action::Quit,
             KeyCode::Esc => {
                 if !self.filter.is_empty() {
+                    let previous_path = self.selected_path();
+                    let previous_row = self.selected;
                     self.filter.clear();
-                    self.selected = 0;
+                    self.restore_selection(previous_path.as_deref(), previous_row);
+                    self.center_selection_pending = true;
                     self.message = "Filter cleared".to_string();
                 }
                 Action::None
