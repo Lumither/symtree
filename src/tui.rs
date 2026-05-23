@@ -9,6 +9,27 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Run `$body` and return `(result, elapsed)`. With `debug_perf` off the timing
+/// path compiles away to just the body and a `Duration::ZERO`.
+#[cfg(feature = "debug_perf")]
+#[macro_export]
+macro_rules! timed {
+    ($($body:tt)*) => {{
+        let __t = ::std::time::Instant::now();
+        let __result = { $($body)* };
+        (__result, __t.elapsed())
+    }};
+}
+
+#[cfg(not(feature = "debug_perf"))]
+#[macro_export]
+macro_rules! timed {
+    ($($body:tt)*) => {{
+        let __result = { $($body)* };
+        (__result, ::std::time::Duration::ZERO)
+    }};
+}
+
 mod preview;
 mod render;
 mod watcher;
@@ -35,6 +56,31 @@ use crate::{
 pub enum GlyphMode {
     Unicode,
     Ascii,
+}
+
+/// If the named overlay flag is set, close it on Esc/Enter/q and short-circuit
+/// key handling. Used by `handle_normal_key` for help / warnings / lsp / perf.
+macro_rules! overlay_close {
+    ($self:ident, $key:ident, $flag:ident) => {
+        if $self.$flag {
+            match $key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                    $self.$flag = false;
+                    $self.message.clear();
+                }
+                _ => {}
+            }
+            return Ok(Action::None);
+        }
+    };
+}
+
+/// Open an overlay by setting its flag and clearing the status bus.
+macro_rules! overlay_open {
+    ($self:ident, $flag:ident) => {{
+        $self.$flag = true;
+        $self.message.clear();
+    }};
 }
 
 fn set_expanded_recursive(nodes: &mut [crate::model::SymbolNode], expanded: bool) {
@@ -81,6 +127,8 @@ struct App {
     show_help: bool,
     show_warnings: bool,
     show_lsp: bool,
+    #[cfg(feature = "debug_perf")]
+    show_perf: bool,
     should_quit: bool,
     preview_cache: Option<PreviewCache>,
     preview_request_tx: Sender<PreviewRequest>,
@@ -100,7 +148,118 @@ struct App {
     center_selection_pending: bool,
     visible_cache: RefCell<Option<Vec<VisibleNode>>>,
     scroll_offset: usize,
+    perf: RefCell<PerfStats>,
+    symbol_count_cache: usize,
 }
+
+#[cfg(feature = "debug_perf")]
+mod perf {
+    use std::time::Duration;
+
+    #[derive(Default, Debug, Clone)]
+    pub(crate) struct PerfStats {
+        pub frame_count: u64,
+        pub total_frame: Duration,
+        pub last_frame: Duration,
+        pub max_frame: Duration,
+        pub last_tree: Duration,
+        pub last_details: Duration,
+        pub last_preview: Duration,
+        pub last_footer: Duration,
+        pub flatten_calls: u64,
+        pub flatten_total: Duration,
+        pub flatten_last: Duration,
+        pub flatten_max: Duration,
+        pub flatten_last_size: usize,
+        pub load_events_drained: u64,
+        pub last_drain_size: usize,
+    }
+
+    impl PerfStats {
+        pub(crate) fn record_frame(&mut self, dur: Duration) {
+            self.frame_count += 1;
+            self.total_frame = self.total_frame.saturating_add(dur);
+            self.last_frame = dur;
+            if dur > self.max_frame {
+                self.max_frame = dur;
+            }
+        }
+
+        pub(crate) fn record_flatten(&mut self, dur: Duration, size: usize) {
+            self.flatten_calls += 1;
+            self.flatten_total = self.flatten_total.saturating_add(dur);
+            self.flatten_last = dur;
+            self.flatten_last_size = size;
+            if dur > self.flatten_max {
+                self.flatten_max = dur;
+            }
+        }
+
+        pub(crate) fn record_render_tree(&mut self, dur: Duration) {
+            self.last_tree = dur;
+        }
+        pub(crate) fn record_render_details(&mut self, dur: Duration) {
+            self.last_details = dur;
+        }
+        pub(crate) fn record_render_preview(&mut self, dur: Duration) {
+            self.last_preview = dur;
+        }
+        pub(crate) fn record_render_footer(&mut self, dur: Duration) {
+            self.last_footer = dur;
+        }
+        pub(crate) fn record_load_drain(&mut self, count: usize) {
+            self.load_events_drained = self.load_events_drained.saturating_add(count as u64);
+            self.last_drain_size = count;
+        }
+
+        pub fn avg_frame(&self) -> Duration {
+            if self.frame_count == 0 {
+                Duration::ZERO
+            } else {
+                Duration::from_nanos(
+                    (self.total_frame.as_nanos() / self.frame_count as u128) as u64,
+                )
+            }
+        }
+
+        pub fn avg_flatten(&self) -> Duration {
+            if self.flatten_calls == 0 {
+                Duration::ZERO
+            } else {
+                Duration::from_nanos(
+                    (self.flatten_total.as_nanos() / self.flatten_calls as u128) as u64,
+                )
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "debug_perf"))]
+mod perf {
+    use std::time::Duration;
+
+    #[derive(Default, Debug, Clone)]
+    pub(crate) struct PerfStats;
+
+    impl PerfStats {
+        #[inline]
+        pub(crate) fn record_frame(&mut self, _: Duration) {}
+        #[inline]
+        pub(crate) fn record_flatten(&mut self, _: Duration, _: usize) {}
+        #[inline]
+        pub(crate) fn record_render_tree(&mut self, _: Duration) {}
+        #[inline]
+        pub(crate) fn record_render_details(&mut self, _: Duration) {}
+        #[inline]
+        pub(crate) fn record_render_preview(&mut self, _: Duration) {}
+        #[inline]
+        pub(crate) fn record_render_footer(&mut self, _: Duration) {}
+        #[inline]
+        pub(crate) fn record_load_drain(&mut self, _: usize) {}
+    }
+}
+
+pub(crate) use perf::PerfStats;
 
 impl App {
     fn new(
@@ -145,6 +304,8 @@ impl App {
             show_help: false,
             show_warnings: false,
             show_lsp: false,
+            #[cfg(feature = "debug_perf")]
+            show_perf: false,
             should_quit: false,
             preview_cache: None,
             preview_request_tx: request_tx,
@@ -164,12 +325,14 @@ impl App {
             center_selection_pending: false,
             visible_cache: RefCell::new(None),
             scroll_offset: 0,
+            perf: RefCell::new(<PerfStats as Default>::default()),
+            symbol_count_cache: 0,
         };
+        app.symbol_count_cache = app.project.symbol_count();
         app.refresh_watched_files();
         if app.project.files.is_empty() {
             let _ = app.load_request_tx.send(());
             app.load_in_flight = true;
-            app.message = "Indexing…".to_string();
         } else if !app.project.warnings.is_empty() {
             app.set_load_message("Loaded");
         }
@@ -180,13 +343,12 @@ impl App {
         self.message = compose_load_message(prefix, &self.project.warnings);
     }
 
-    fn request_reload(&mut self, status: &str) {
+    fn request_reload(&mut self) {
         if self.load_in_flight {
             return;
         }
         let _ = self.load_request_tx.send(());
         self.load_in_flight = true;
-        self.message = status.to_string();
     }
 
     fn handle_load_event(&mut self, event: LoadEvent) {
@@ -196,6 +358,7 @@ impl App {
                 self.project.files.clear();
                 self.project.warnings.clear();
                 self.invalidate_visible();
+                self.symbol_count_cache = 0;
                 self.loaded_file_count = 0;
                 self.discovered_file_count = 0;
                 self.load_in_flight = true;
@@ -205,19 +368,20 @@ impl App {
                 if previous_path.is_some() {
                     self.selected = 0;
                 }
-                self.update_indexing_message();
             }
             LoadEvent::Discovered(n) => {
                 self.discovered_file_count = self.discovered_file_count.saturating_add(n);
-                self.update_indexing_message();
             }
             LoadEvent::FileLoaded(file) => {
+                self.symbol_count_cache = self
+                    .symbol_count_cache
+                    .saturating_add(file.descendant_count());
                 self.project.files.push(file);
                 self.invalidate_visible();
                 self.loaded_file_count += 1;
-                self.update_indexing_message();
             }
             LoadEvent::Warning(text) => {
+                self.message = format!("! {text}");
                 self.project.warnings.push(text);
             }
             LoadEvent::Finished => {
@@ -228,20 +392,6 @@ impl App {
                 self.set_load_message(&format!("Loaded {} files", self.loaded_file_count));
             }
         }
-    }
-
-    fn update_indexing_message(&mut self) {
-        if !self.load_in_flight {
-            return;
-        }
-        self.message = if self.discovered_file_count > 0 {
-            format!(
-                "Indexing… {}/{} files",
-                self.loaded_file_count, self.discovered_file_count
-            )
-        } else {
-            format!("Indexing… {} files", self.loaded_file_count)
-        };
     }
 
     fn refresh_watched_files(&mut self) {
@@ -255,8 +405,12 @@ impl App {
 
     fn visible_nodes(&self) -> Ref<'_, Vec<VisibleNode>> {
         if self.visible_cache.borrow().is_none() {
+            let start = Instant::now();
             let computed = flatten_visible(&self.project.files, &self.filter);
+            let elapsed = start.elapsed();
+            let size = computed.len();
             *self.visible_cache.borrow_mut() = Some(computed);
+            self.perf.borrow_mut().record_flatten(elapsed, size);
         }
         Ref::map(self.visible_cache.borrow(), |opt| {
             opt.as_ref().expect("filled above")
@@ -295,38 +449,11 @@ impl App {
             return Ok(Action::Quit);
         }
 
-        if self.show_help {
-            match key.code {
-                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
-                    self.show_help = false;
-                    self.message.clear();
-                }
-                _ => {}
-            }
-            return Ok(Action::None);
-        }
-
-        if self.show_warnings {
-            match key.code {
-                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
-                    self.show_warnings = false;
-                    self.message.clear();
-                }
-                _ => {}
-            }
-            return Ok(Action::None);
-        }
-
-        if self.show_lsp {
-            match key.code {
-                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
-                    self.show_lsp = false;
-                    self.message.clear();
-                }
-                _ => {}
-            }
-            return Ok(Action::None);
-        }
+        overlay_close!(self, key, show_help);
+        overlay_close!(self, key, show_warnings);
+        overlay_close!(self, key, show_lsp);
+        #[cfg(feature = "debug_perf")]
+        overlay_close!(self, key, show_perf);
 
         let action = match key.code {
             KeyCode::Char('q') => Action::Quit,
@@ -500,9 +627,13 @@ impl App {
                     self.message.clear();
                 }
             }
-            "lsp" => {
-                self.show_lsp = true;
-                self.message.clear();
+            "lsp" => overlay_open!(self, show_lsp),
+            #[cfg(feature = "debug_perf")]
+            "perf" => overlay_open!(self, show_perf),
+            #[cfg(feature = "debug_perf")]
+            "perf reset" => {
+                *self.perf.borrow_mut() = PerfStats::default();
+                self.message = "perf stats cleared".to_string();
             }
             "collapse" => {
                 set_expanded_recursive(&mut self.project.files, false);
@@ -759,16 +890,17 @@ fn run_app(terminal: &mut DefaultTerminal, mut app: App) -> AppResult<()> {
             && !app.load_in_flight
         {
             app.symbols_dirty_at = None;
-            app.request_reload("Syncing symbols…");
+            app.request_reload();
             needs_draw = true;
         }
 
-        let mut got_load_event = false;
+        let mut drained = 0usize;
         while let Ok(event) = app.load_event_rx.try_recv() {
-            got_load_event = true;
+            drained += 1;
             app.handle_load_event(event);
         }
-        if got_load_event {
+        if drained > 0 {
+            app.perf.borrow_mut().record_load_drain(drained);
             needs_draw = true;
         }
 
@@ -802,9 +934,12 @@ fn run_app(terminal: &mut DefaultTerminal, mut app: App) -> AppResult<()> {
 
         if needs_draw {
             app.clamp_selection();
+            let frame_start = Instant::now();
             terminal
                 .draw(|frame| render(frame, &mut app))
                 .context("failed to render frame")?;
+            let elapsed = frame_start.elapsed();
+            app.perf.borrow_mut().record_frame(elapsed);
             needs_draw = false;
         }
 
@@ -818,7 +953,7 @@ fn run_app(terminal: &mut DefaultTerminal, mut app: App) -> AppResult<()> {
                 match app.handle_key(key)? {
                     Action::None => {}
                     Action::Quit => app.should_quit = true,
-                    Action::Reload => app.request_reload("Reloading…"),
+                    Action::Reload => app.request_reload(),
                     Action::OpenSelection => open_selection(terminal, &mut app)?,
                 }
                 needs_draw = true;

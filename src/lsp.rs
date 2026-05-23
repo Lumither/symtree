@@ -8,6 +8,9 @@ use std::{
 };
 
 const DOCUMENT_SYMBOLS_TIMEOUT: Duration = Duration::from_secs(15);
+const MEMORY_CHECK_INTERVAL: Duration = Duration::from_secs(3);
+const MEMORY_ABSOLUTE_THRESHOLD: u64 = 5 * 1024 * 1024 * 1024;
+const MEMORY_RATE_THRESHOLD: u64 = 500 * 1024 * 1024;
 
 use serde_json::{Value, json};
 
@@ -64,6 +67,11 @@ pub fn stream_language(root: &Path, lang: &LanguageDef, tx: Sender<LoadEvent>) {
     }
 
     let language_id = lang.language_id.as_deref().unwrap_or("plaintext");
+    let lsp_pid = client.pid();
+    let mut last_memory_check = Instant::now();
+    let mut last_memory_rss: u64 = 0;
+    let mut warned_absolute = false;
+    let mut warned_rate = false;
     for file in files {
         let relative_name = relative_path(root, &file);
         let text = match std::fs::read_to_string(&file) {
@@ -91,9 +99,90 @@ pub fn stream_language(root: &Path, lang: &LanguageDef, tx: Sender<LoadEvent>) {
                 warn(&tx, format!("{relative_name}: symbols: {error}"));
             }
         }
+
+        if last_memory_check.elapsed() >= MEMORY_CHECK_INTERVAL
+            && let Some(pid) = lsp_pid
+            && let Some(rss) = process_tree_rss_bytes(pid)
+        {
+            if !warned_absolute && rss > MEMORY_ABSOLUTE_THRESHOLD {
+                warn(
+                    &tx,
+                    format!(
+                        "{lang_label}: high memory: {:.1} GiB",
+                        rss as f64 / (1024.0 * 1024.0 * 1024.0)
+                    ),
+                );
+                warned_absolute = true;
+            }
+            if !warned_rate && last_memory_rss > 0 {
+                let delta = rss.saturating_sub(last_memory_rss);
+                if delta > MEMORY_RATE_THRESHOLD {
+                    warn(
+                        &tx,
+                        format!(
+                            "{lang_label}: rapid memory growth: +{:.0} MiB in {:.0}s",
+                            delta as f64 / (1024.0 * 1024.0),
+                            last_memory_check.elapsed().as_secs_f64()
+                        ),
+                    );
+                    warned_rate = true;
+                }
+            }
+            last_memory_rss = rss;
+            last_memory_check = Instant::now();
+        }
     }
 
     client.shutdown();
+}
+
+fn process_tree_rss_bytes(root_pid: u32) -> Option<u64> {
+    let pids = collect_tree_pids(root_pid);
+    if pids.is_empty() {
+        return None;
+    }
+    let pid_list: Vec<String> = pids.iter().map(u32::to_string).collect();
+    let output = Command::new("ps")
+        .arg("-o")
+        .arg("rss=")
+        .arg("-p")
+        .arg(pid_list.join(","))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let total_kb: u64 = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u64>().ok())
+        .sum();
+    Some(total_kb.saturating_mul(1024))
+}
+
+fn collect_tree_pids(root: u32) -> Vec<u32> {
+    let mut result = vec![root];
+    let mut queue = vec![root];
+    while let Some(parent) = queue.pop() {
+        for child in direct_children_pids(parent) {
+            result.push(child);
+            queue.push(child);
+        }
+    }
+    result
+}
+
+fn direct_children_pids(parent: u32) -> Vec<u32> {
+    let output = Command::new("pgrep")
+        .arg("-P")
+        .arg(parent.to_string())
+        .output();
+    match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 pub fn lsp_is_available(command: &str) -> bool {
@@ -168,6 +257,10 @@ impl LspClient {
             root_uri,
             root_name,
         })
+    }
+
+    fn pid(&self) -> Option<u32> {
+        Some(self.child.id())
     }
 
     fn initialize(&mut self, root: &Path, root_uri: &str, root_name: &str) -> AppResult<()> {

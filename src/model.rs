@@ -57,6 +57,10 @@ impl SymbolNode {
     pub fn has_children(&self) -> bool {
         !self.children.is_empty()
     }
+
+    pub fn descendant_count(&self) -> usize {
+        count_symbols(&self.children)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -6,7 +6,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::{
     model::{SymbolKind, SymbolNode},
@@ -31,7 +31,8 @@ pub(super) fn render(frame: &mut Frame, app: &mut App) {
         .split(area);
 
     render_body(frame, app, sections[0]);
-    render_footer(frame, app, sections[1]);
+    let (_, footer) = crate::timed!(render_footer(frame, app, sections[1]));
+    app.perf.borrow_mut().record_render_footer(footer);
 
     if app.show_help {
         render_help(frame, app, area);
@@ -39,6 +40,11 @@ pub(super) fn render(frame: &mut Frame, app: &mut App) {
         render_warnings(frame, app, area);
     } else if app.show_lsp {
         render_lsp(frame, app, area);
+    } else {
+        #[cfg(feature = "debug_perf")]
+        if app.show_perf {
+            render_perf(frame, app, area);
+        }
     }
 }
 
@@ -52,26 +58,47 @@ pub(super) fn render_too_small(frame: &mut Frame, area: Rect) {
 
 pub(super) fn status_line(app: &App, width: u16) -> Line<'static> {
     let width = usize::from(width);
+    let indexing = indexing_text(app);
     let stats = format!(
         "files {} symbols {} visible {}",
         app.project.file_count(),
-        app.project.symbol_count(),
+        app.symbol_count_cache,
         app.visible_nodes().len()
     );
-    let stats_width = display_width(&stats);
-    let path_width = width.saturating_sub(stats_width.saturating_add(1));
+    let right_width = display_width(&indexing).saturating_add(display_width(&stats));
+    let path_width = width.saturating_sub(right_width.saturating_add(1));
     let path = truncate_left(&app.project.root.display().to_string(), path_width);
     let gap = width
-        .saturating_sub(display_width(&path).saturating_add(stats_width))
+        .saturating_sub(display_width(&path).saturating_add(right_width))
         .max(1);
 
     let mut spans = vec![
         Span::styled(path, status_bar_style()),
         Span::styled(" ".repeat(gap), status_bar_style()),
     ];
+    if !indexing.is_empty() {
+        spans.push(Span::styled(
+            indexing,
+            status_bar_style().fg(Color::Indexed(244)),
+        ));
+    }
     spans.extend(status_stats_spans(app));
 
     Line::from(spans)
+}
+
+fn indexing_text(app: &App) -> String {
+    if !app.load_in_flight {
+        return String::new();
+    }
+    if app.discovered_file_count > 0 {
+        format!(
+            "indexing {}/{}  ",
+            app.loaded_file_count, app.discovered_file_count
+        )
+    } else {
+        format!("indexing {}  ", app.loaded_file_count)
+    }
 }
 
 pub(super) fn status_stats_spans(app: &App) -> Vec<Span<'static>> {
@@ -83,7 +110,7 @@ pub(super) fn status_stats_spans(app: &App) -> Vec<Span<'static>> {
         ),
         Span::styled(" symbols ", status_bar_style().fg(Color::Green).bold()),
         Span::styled(
-            app.project.symbol_count().to_string(),
+            app.symbol_count_cache.to_string(),
             status_bar_style().fg(Color::White).bold(),
         ),
         Span::styled(" visible ", status_bar_style().fg(Color::Yellow).bold()),
@@ -101,17 +128,26 @@ pub(super) fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
             .split(area);
-        render_tree(frame, app, columns[0]);
+        let (_, tree) = crate::timed!(render_tree(frame, app, columns[0]));
 
         let details_height = preferred_details_height(app, columns[1].height);
         let right_rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(details_height), Constraint::Min(3)])
             .split(columns[1]);
-        render_details(frame, app, right_rows[0]);
-        render_preview(frame, app, right_rows[1]);
+        let (_, details) = crate::timed!(render_details(frame, app, right_rows[0]));
+        let (_, preview) = crate::timed!(render_preview(frame, app, right_rows[1]));
+
+        let mut p = app.perf.borrow_mut();
+        p.record_render_tree(tree);
+        p.record_render_details(details);
+        p.record_render_preview(preview);
     } else {
-        render_tree(frame, app, area);
+        let (_, tree) = crate::timed!(render_tree(frame, app, area));
+        let mut p = app.perf.borrow_mut();
+        p.record_render_tree(tree);
+        p.record_render_details(Duration::ZERO);
+        p.record_render_preview(Duration::ZERO);
     }
 }
 
@@ -533,6 +569,86 @@ pub(super) fn truncate_left(text: &str, max_width: usize) -> String {
     tail.reverse();
     format!("~{}", tail.into_iter().collect::<String>())
 }
+#[cfg(feature = "debug_perf")]
+pub(super) fn render_perf(frame: &mut Frame, app: &App, area: Rect) {
+    let popup = centered_rect(area, 70, area.height.saturating_sub(4));
+    let perf = app.perf.borrow();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    let section = |title: &str| {
+        Line::from(Span::styled(
+            title.to_string(),
+            Style::default().fg(Color::Cyan).bold(),
+        ))
+    };
+    let row = |label: &str, value: String| {
+        Line::from(vec![
+            Span::styled(format!("  {label:<22}"), Style::default().fg(Color::Gray)),
+            Span::styled(value, Style::default().fg(Color::White)),
+        ])
+    };
+
+    lines.push(section("Frames"));
+    lines.push(row("count", perf.frame_count.to_string()));
+    lines.push(row("last", format_duration(perf.last_frame)));
+    lines.push(row("avg", format_duration(perf.avg_frame())));
+    lines.push(row("max", format_duration(perf.max_frame)));
+    lines.push(Line::raw(""));
+
+    lines.push(section("Last render breakdown"));
+    lines.push(row("tree", format_duration(perf.last_tree)));
+    lines.push(row("details", format_duration(perf.last_details)));
+    lines.push(row("preview", format_duration(perf.last_preview)));
+    lines.push(row("footer", format_duration(perf.last_footer)));
+    lines.push(Line::raw(""));
+
+    lines.push(section("flatten_visible cache rebuilds"));
+    lines.push(row("count", perf.flatten_calls.to_string()));
+    lines.push(row("last", format_duration(perf.flatten_last)));
+    lines.push(row(
+        "last size",
+        format!("{} nodes", perf.flatten_last_size),
+    ));
+    lines.push(row("avg", format_duration(perf.avg_flatten())));
+    lines.push(row("max", format_duration(perf.flatten_max)));
+    lines.push(Line::raw(""));
+
+    lines.push(section("Load events"));
+    lines.push(row("total drained", perf.load_events_drained.to_string()));
+    lines.push(row("last drain size", perf.last_drain_size.to_string()));
+    lines.push(Line::raw(""));
+
+    lines.push(Line::from(Span::styled(
+        "Esc / Enter / q      close      |      :perf reset",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(" Performance ")
+                    .borders(Borders::ALL)
+                    .border_set(border_set(app.glyph_mode)),
+            )
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+#[cfg(feature = "debug_perf")]
+fn format_duration(d: Duration) -> String {
+    let us = d.as_micros();
+    if us < 1_000 {
+        format!("{us} µs")
+    } else if us < 1_000_000 {
+        format!("{:.2} ms", us as f64 / 1_000.0)
+    } else {
+        format!("{:.2} s", us as f64 / 1_000_000.0)
+    }
+}
+
 pub(super) fn render_warnings(frame: &mut Frame, app: &App, area: Rect) {
     let popup = centered_rect(area, 80, area.height.saturating_sub(4));
     let mut lines: Vec<Line<'static>> = Vec::new();
