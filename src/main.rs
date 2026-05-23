@@ -3,6 +3,7 @@ mod languages;
 mod lsp;
 mod model;
 mod project;
+mod query;
 mod tree;
 mod tui;
 

@@ -1,6 +1,6 @@
 use std::{
     cell::{Ref, RefCell},
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env, mem,
     path::PathBuf,
     process::Command,
@@ -30,6 +30,7 @@ macro_rules! timed {
     }};
 }
 
+mod autocomplete;
 mod preview;
 mod render;
 mod watcher;
@@ -47,6 +48,7 @@ use crate::{
     languages::LanguageDef,
     lsp::LoadEvent,
     model::ProjectSymbols,
+    query::{self, Expr},
     tree::{
         SelectionTarget, VisibleNode, flatten_visible, get_node, get_node_mut, selection_target,
     },
@@ -58,15 +60,34 @@ pub enum GlyphMode {
     Ascii,
 }
 
-/// If the named overlay flag is set, close it on Esc/Enter/q and short-circuit
-/// key handling. Used by `handle_normal_key` for help / warnings / lsp / perf.
+/// Close-on-Esc/Enter/q + scroll keys (j/k/d/u/g/G/PageUp/Down/Home/End) for
+/// help / warnings / lsp / perf overlays.
 macro_rules! overlay_close {
     ($self:ident, $key:ident, $flag:ident) => {
         if $self.$flag {
             match $key.code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
                     $self.$flag = false;
+                    $self.overlay_scroll = 0;
                     $self.message.clear();
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    $self.overlay_scroll = $self.overlay_scroll.saturating_add(1);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    $self.overlay_scroll = $self.overlay_scroll.saturating_sub(1);
+                }
+                KeyCode::Char('d') | KeyCode::PageDown => {
+                    $self.overlay_scroll = $self.overlay_scroll.saturating_add(10);
+                }
+                KeyCode::Char('u') | KeyCode::PageUp => {
+                    $self.overlay_scroll = $self.overlay_scroll.saturating_sub(10);
+                }
+                KeyCode::Char('g') | KeyCode::Home => {
+                    $self.overlay_scroll = 0;
+                }
+                KeyCode::Char('G') | KeyCode::End => {
+                    $self.overlay_scroll = usize::MAX;
                 }
                 _ => {}
             }
@@ -75,12 +96,75 @@ macro_rules! overlay_close {
     };
 }
 
-/// Open an overlay by setting its flag and clearing the status bus.
+/// Open an overlay by setting its flag, resetting scroll, and clearing the
+/// status bus.
 macro_rules! overlay_open {
     ($self:ident, $flag:ident) => {{
         $self.$flag = true;
+        $self.overlay_scroll = 0;
         $self.message.clear();
     }};
+}
+
+fn char_index_to_byte(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len())
+}
+
+fn insert_at_cursor(buf: &mut String, cursor: &mut usize, ch: char) {
+    let byte = char_index_to_byte(buf, *cursor);
+    buf.insert(byte, ch);
+    *cursor += 1;
+}
+
+fn delete_before_cursor(buf: &mut String, cursor: &mut usize) -> bool {
+    if *cursor == 0 {
+        return false;
+    }
+    let byte = char_index_to_byte(buf, *cursor - 1);
+    buf.remove(byte);
+    *cursor -= 1;
+    true
+}
+
+fn delete_at_cursor(buf: &mut String, cursor: usize) -> bool {
+    let chars_count = buf.chars().count();
+    if cursor >= chars_count {
+        return false;
+    }
+    let byte = char_index_to_byte(buf, cursor);
+    buf.remove(byte);
+    true
+}
+
+fn prev_word(text: &str, cursor: usize) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    if cursor == 0 {
+        return 0;
+    }
+    let mut i = cursor.min(chars.len());
+    while i > 0 && chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    while i > 0 && !chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    i
+}
+
+fn next_word(text: &str, cursor: usize) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = cursor.min(len);
+    while i < len && !chars[i].is_whitespace() {
+        i += 1;
+    }
+    while i < len && chars[i].is_whitespace() {
+        i += 1;
+    }
+    i
 }
 
 fn set_expanded_recursive(nodes: &mut [crate::model::SymbolNode], expanded: bool) {
@@ -88,6 +172,81 @@ fn set_expanded_recursive(nodes: &mut [crate::model::SymbolNode], expanded: bool
         node.expanded = expanded;
         set_expanded_recursive(&mut node.children, expanded);
     }
+}
+
+fn default_expanded(node: &crate::model::SymbolNode) -> bool {
+    !matches!(node.kind, crate::model::SymbolKind::File)
+}
+
+fn collect_expanded_overrides(nodes: &[crate::model::SymbolNode]) -> HashMap<Vec<String>, bool> {
+    fn walk(
+        nodes: &[crate::model::SymbolNode],
+        path: &mut Vec<String>,
+        out: &mut HashMap<Vec<String>, bool>,
+    ) {
+        for node in nodes {
+            path.push(node.name.clone());
+            if node.expanded != default_expanded(node) {
+                out.insert(path.clone(), node.expanded);
+            }
+            walk(&node.children, path, out);
+            path.pop();
+        }
+    }
+    let mut out = HashMap::new();
+    let mut path = Vec::new();
+    walk(nodes, &mut path, &mut out);
+    out
+}
+
+fn apply_expanded_overrides(
+    node: &mut crate::model::SymbolNode,
+    overrides: &HashMap<Vec<String>, bool>,
+) {
+    fn walk(
+        node: &mut crate::model::SymbolNode,
+        path: &mut Vec<String>,
+        overrides: &HashMap<Vec<String>, bool>,
+    ) {
+        path.push(node.name.clone());
+        if let Some(&v) = overrides.get(path) {
+            node.expanded = v;
+        }
+        for child in &mut node.children {
+            walk(child, path, overrides);
+        }
+        path.pop();
+    }
+    let mut path = Vec::new();
+    walk(node, &mut path, overrides);
+}
+
+fn name_path_for(
+    nodes: &[crate::model::SymbolNode],
+    index_path: &[usize],
+) -> Option<Vec<String>> {
+    let mut out = Vec::with_capacity(index_path.len());
+    let mut current = nodes;
+    for &idx in index_path {
+        let node = current.get(idx)?;
+        out.push(node.name.clone());
+        current = &node.children;
+    }
+    Some(out)
+}
+
+fn name_path_to_index_path(
+    nodes: &[crate::model::SymbolNode],
+    name_path: &[String],
+) -> Option<Vec<usize>> {
+    let mut out = Vec::with_capacity(name_path.len());
+    let mut current = nodes;
+    for name in name_path {
+        let i = current.iter().position(|n| &n.name == name)?;
+        out.push(i);
+        current = &current[i].children;
+    }
+    Some(out)
 }
 
 fn compose_load_message(prefix: &str, warnings: &[String]) -> String {
@@ -125,6 +284,7 @@ struct App {
     message: String,
     glyph_mode: GlyphMode,
     show_help: bool,
+    show_keymap: bool,
     show_warnings: bool,
     show_lsp: bool,
     #[cfg(feature = "debug_perf")]
@@ -150,6 +310,14 @@ struct App {
     scroll_offset: usize,
     perf: RefCell<PerfStats>,
     symbol_count_cache: usize,
+    query: Option<Expr>,
+    query_source: Option<String>,
+    candidate_index: usize,
+    cursor_pos: usize,
+    overlay_scroll: usize,
+    pending_expanded: HashMap<Vec<String>, bool>,
+    pending_selection_name_path: Option<Vec<String>>,
+    pending_selection_row: usize,
 }
 
 #[cfg(feature = "debug_perf")]
@@ -302,6 +470,7 @@ impl App {
             message: String::new(),
             glyph_mode,
             show_help: false,
+            show_keymap: false,
             show_warnings: false,
             show_lsp: false,
             #[cfg(feature = "debug_perf")]
@@ -327,6 +496,14 @@ impl App {
             scroll_offset: 0,
             perf: RefCell::new(<PerfStats as Default>::default()),
             symbol_count_cache: 0,
+            query: None,
+            query_source: None,
+            candidate_index: 0,
+            cursor_pos: 0,
+            overlay_scroll: 0,
+            pending_expanded: HashMap::new(),
+            pending_selection_name_path: None,
+            pending_selection_row: 0,
         };
         app.symbol_count_cache = app.project.symbol_count();
         app.refresh_watched_files();
@@ -354,7 +531,13 @@ impl App {
     fn handle_load_event(&mut self, event: LoadEvent) {
         match event {
             LoadEvent::Started => {
-                let previous_path = self.selected_path();
+                let previous_index_path = self.selected_path();
+                self.pending_selection_name_path = previous_index_path
+                    .as_deref()
+                    .and_then(|p| name_path_for(&self.project.files, p));
+                self.pending_selection_row = self.selected;
+                self.pending_expanded = collect_expanded_overrides(&self.project.files);
+
                 self.project.files.clear();
                 self.project.warnings.clear();
                 self.invalidate_visible();
@@ -365,14 +548,14 @@ impl App {
                 self.preview_cache = None;
                 self.preview_in_flight = None;
                 self.loading_overlay_shown = false;
-                if previous_path.is_some() {
-                    self.selected = 0;
-                }
             }
             LoadEvent::Discovered(n) => {
                 self.discovered_file_count = self.discovered_file_count.saturating_add(n);
             }
-            LoadEvent::FileLoaded(file) => {
+            LoadEvent::FileLoaded(mut file) => {
+                if !self.pending_expanded.is_empty() {
+                    apply_expanded_overrides(&mut file, &self.pending_expanded);
+                }
                 self.symbol_count_cache = self
                     .symbol_count_cache
                     .saturating_add(file.descendant_count());
@@ -389,6 +572,19 @@ impl App {
                 self.invalidate_visible();
                 self.load_in_flight = false;
                 self.refresh_watched_files();
+
+                let restored_index_path = self
+                    .pending_selection_name_path
+                    .as_deref()
+                    .and_then(|np| name_path_to_index_path(&self.project.files, np));
+                self.restore_selection(
+                    restored_index_path.as_deref(),
+                    self.pending_selection_row,
+                );
+                self.pending_selection_name_path = None;
+                self.pending_selection_row = 0;
+                self.pending_expanded.clear();
+
                 self.set_load_message(&format!("Loaded {} files", self.loaded_file_count));
             }
         }
@@ -406,7 +602,8 @@ impl App {
     fn visible_nodes(&self) -> Ref<'_, Vec<VisibleNode>> {
         if self.visible_cache.borrow().is_none() {
             let start = Instant::now();
-            let computed = flatten_visible(&self.project.files, &self.filter);
+            let query = self.active_query();
+            let computed = flatten_visible(&self.project.files, query.as_ref());
             let elapsed = start.elapsed();
             let size = computed.len();
             *self.visible_cache.borrow_mut() = Some(computed);
@@ -419,6 +616,20 @@ impl App {
 
     fn invalidate_visible(&self) {
         *self.visible_cache.borrow_mut() = None;
+    }
+
+    fn active_query(&self) -> Option<Expr> {
+        let from_filter = if self.filter.trim().is_empty() {
+            None
+        } else {
+            query::parse(&self.filter).ok().flatten()
+        };
+        match (self.query.clone(), from_filter) {
+            (Some(a), Some(b)) => Some(Expr::And(vec![a, b])),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
     }
 
     fn clamp_selection(&mut self) {
@@ -450,6 +661,7 @@ impl App {
         }
 
         overlay_close!(self, key, show_help);
+        overlay_close!(self, key, show_keymap);
         overlay_close!(self, key, show_warnings);
         overlay_close!(self, key, show_lsp);
         #[cfg(feature = "debug_perf")]
@@ -523,12 +735,16 @@ impl App {
             }
             KeyCode::Char('/') => {
                 self.mode = Mode::Search;
+                self.cursor_pos = self.filter.chars().count();
+                self.candidate_index = 0;
                 self.message.clear();
                 Action::None
             }
             KeyCode::Char(':') => {
                 self.mode = Mode::Command;
                 self.command.clear();
+                self.cursor_pos = 0;
+                self.candidate_index = 0;
                 self.message.clear();
                 Action::None
             }
@@ -543,28 +759,102 @@ impl App {
     fn handle_search_key(&mut self, key: KeyEvent) -> Action {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.filter.clear();
+                self.cursor_pos = 0;
+                self.selected = 0;
+                self.candidate_index = 0;
+                self.invalidate_visible();
+                Action::None
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cursor_pos = 0;
+                Action::None
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cursor_pos = self.filter.chars().count();
+                Action::None
+            }
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cursor_pos = prev_word(&self.filter, self.cursor_pos);
+                Action::None
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cursor_pos = next_word(&self.filter, self.cursor_pos);
+                Action::None
+            }
             KeyCode::Esc | KeyCode::Enter => {
                 self.mode = Mode::Normal;
+                self.candidate_index = 0;
+                Action::None
+            }
+            KeyCode::Tab => {
+                let cands = autocomplete::search_candidates(self);
+                if let Some(pick) =
+                    cands.get(self.candidate_index.min(cands.len().saturating_sub(1)))
+                {
+                    self.filter = autocomplete::replace_last_token(&self.filter, pick);
+                    self.cursor_pos = self.filter.chars().count();
+                    self.invalidate_visible();
+                }
+                self.candidate_index = 0;
+                Action::None
+            }
+            KeyCode::Up => {
+                let cands = autocomplete::search_candidates(self);
+                let len = cands.len();
+                if len > 0 {
+                    self.candidate_index = (self.candidate_index + len - 1) % len;
+                }
+                Action::None
+            }
+            KeyCode::Down => {
+                let cands = autocomplete::search_candidates(self);
+                let len = cands.len();
+                if len > 0 {
+                    self.candidate_index = (self.candidate_index + 1) % len;
+                }
+                Action::None
+            }
+            KeyCode::Left => {
+                self.cursor_pos = self.cursor_pos.saturating_sub(1);
+                Action::None
+            }
+            KeyCode::Right => {
+                self.cursor_pos = (self.cursor_pos + 1).min(self.filter.chars().count());
+                Action::None
+            }
+            KeyCode::Home => {
+                self.cursor_pos = 0;
+                Action::None
+            }
+            KeyCode::End => {
+                self.cursor_pos = self.filter.chars().count();
                 Action::None
             }
             KeyCode::Backspace => {
-                self.filter.pop();
-                self.selected = 0;
-                self.invalidate_visible();
+                if delete_before_cursor(&mut self.filter, &mut self.cursor_pos) {
+                    self.selected = 0;
+                    self.candidate_index = 0;
+                    self.invalidate_visible();
+                }
                 Action::None
             }
             KeyCode::Delete => {
-                self.filter.clear();
-                self.selected = 0;
-                self.invalidate_visible();
+                if delete_at_cursor(&mut self.filter, self.cursor_pos) {
+                    self.selected = 0;
+                    self.candidate_index = 0;
+                    self.invalidate_visible();
+                }
                 Action::None
             }
             KeyCode::Char(char) => {
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT)
                 {
-                    self.filter.push(char);
+                    insert_at_cursor(&mut self.filter, &mut self.cursor_pos, char);
                     self.selected = 0;
+                    self.candidate_index = 0;
                     self.invalidate_visible();
                 }
                 Action::None
@@ -576,30 +866,110 @@ impl App {
     fn handle_command_key(&mut self, key: KeyEvent) -> Action {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.command.clear();
+                self.cursor_pos = 0;
+                self.candidate_index = 0;
+                Action::None
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cursor_pos = 0;
+                Action::None
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cursor_pos = self.command.chars().count();
+                Action::None
+            }
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cursor_pos = prev_word(&self.command, self.cursor_pos);
+                Action::None
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cursor_pos = next_word(&self.command, self.cursor_pos);
+                Action::None
+            }
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
                 self.command.clear();
+                self.candidate_index = 0;
                 Action::None
             }
             KeyCode::Enter => {
+                if self.command.trim() == "query"
+                    && let Some(src) = self.query_source.clone()
+                {
+                    self.command = format!("query {src}");
+                    self.cursor_pos = self.command.chars().count();
+                    self.candidate_index = 0;
+                    return Action::None;
+                }
                 self.execute_command();
                 self.mode = Mode::Normal;
                 self.command.clear();
+                self.candidate_index = 0;
+                Action::None
+            }
+            KeyCode::Tab => {
+                let cands = autocomplete::command_candidates(self);
+                if let Some(pick) =
+                    cands.get(self.candidate_index.min(cands.len().saturating_sub(1)))
+                {
+                    self.command = autocomplete::replace_last_token(&self.command, pick);
+                    self.cursor_pos = self.command.chars().count();
+                }
+                self.candidate_index = 0;
+                Action::None
+            }
+            KeyCode::Up => {
+                let cands = autocomplete::command_candidates(self);
+                let len = cands.len();
+                if len > 0 {
+                    self.candidate_index = (self.candidate_index + len - 1) % len;
+                }
+                Action::None
+            }
+            KeyCode::Down => {
+                let cands = autocomplete::command_candidates(self);
+                let len = cands.len();
+                if len > 0 {
+                    self.candidate_index = (self.candidate_index + 1) % len;
+                }
+                Action::None
+            }
+            KeyCode::Left => {
+                self.cursor_pos = self.cursor_pos.saturating_sub(1);
+                Action::None
+            }
+            KeyCode::Right => {
+                self.cursor_pos = (self.cursor_pos + 1).min(self.command.chars().count());
+                Action::None
+            }
+            KeyCode::Home => {
+                self.cursor_pos = 0;
+                Action::None
+            }
+            KeyCode::End => {
+                self.cursor_pos = self.command.chars().count();
                 Action::None
             }
             KeyCode::Backspace => {
-                self.command.pop();
+                if delete_before_cursor(&mut self.command, &mut self.cursor_pos) {
+                    self.candidate_index = 0;
+                }
                 Action::None
             }
             KeyCode::Delete => {
-                self.command.clear();
+                if delete_at_cursor(&mut self.command, self.cursor_pos) {
+                    self.candidate_index = 0;
+                }
                 Action::None
             }
             KeyCode::Char(char) => {
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT)
                 {
-                    self.command.push(char);
+                    insert_at_cursor(&mut self.command, &mut self.cursor_pos, char);
+                    self.candidate_index = 0;
                 }
                 Action::None
             }
@@ -617,13 +987,20 @@ impl App {
         match command.as_str() {
             "help" => {
                 self.show_help = true;
+                self.overlay_scroll = 0;
                 self.message = "Help".to_string();
+            }
+            "keymap" | "keys" => {
+                self.show_keymap = true;
+                self.overlay_scroll = 0;
+                self.message = "Keymap".to_string();
             }
             "warnings" | "w" => {
                 if self.project.warnings.is_empty() {
                     self.message = "No warnings".to_string();
                 } else {
                     self.show_warnings = true;
+                    self.overlay_scroll = 0;
                     self.message.clear();
                 }
             }
@@ -648,6 +1025,42 @@ impl App {
             }
             "q" | "quit" => {
                 self.should_quit = true;
+            }
+            "query" | "query clear" => {
+                self.query = None;
+                self.query_source = None;
+                self.invalidate_visible();
+                self.selected = 0;
+                self.message = "query cleared".to_string();
+            }
+            _ if command.starts_with("query ") => {
+                let expr_src = command["query ".len()..].trim();
+                if expr_src.is_empty() || expr_src == "clear" {
+                    self.query = None;
+                    self.query_source = None;
+                    self.invalidate_visible();
+                    self.selected = 0;
+                    self.message = "query cleared".to_string();
+                } else {
+                    match query::parse(expr_src) {
+                        Ok(Some(expr)) => {
+                            self.query = Some(expr);
+                            self.query_source = Some(expr_src.to_string());
+                            self.invalidate_visible();
+                            self.selected = 0;
+                            self.message.clear();
+                        }
+                        Ok(None) => {
+                            self.query = None;
+                            self.query_source = None;
+                            self.invalidate_visible();
+                            self.message = "query cleared".to_string();
+                        }
+                        Err(err) => {
+                            self.message = format!("! query: {err}");
+                        }
+                    }
+                }
             }
             _ => {
                 self.message = format!("Unknown command: :{command}");
@@ -1170,6 +1583,36 @@ mod tests {
         app.restore_selection(Some(&previous_path), 3);
 
         assert_eq!(app.selected_path().as_deref(), Some(&[0, 0][..]));
+    }
+
+    #[test]
+    fn reload_preserves_expansion_and_cursor() {
+        let mut app = sample_app();
+        set_expanded_recursive(&mut app.project.files, false);
+        app.project.files[0].expanded = true;
+        app.project.files[0].children[0].expanded = true;
+        app.invalidate_visible();
+        app.selected = 2;
+        let target_path = app.selected_path().expect("selection");
+        let target_names =
+            name_path_for(&app.project.files, &target_path).expect("name path");
+
+        let saved_files = app.project.files.clone();
+
+        app.handle_load_event(LoadEvent::Started);
+        for file in saved_files {
+            app.handle_load_event(LoadEvent::FileLoaded(file));
+        }
+        app.handle_load_event(LoadEvent::Finished);
+
+        assert!(app.project.files[0].expanded);
+        assert!(app.project.files[0].children[0].expanded);
+        assert!(!app.project.files[0].children[1].expanded);
+
+        let restored_names =
+            name_path_for(&app.project.files, &app.selected_path().expect("selection"))
+                .expect("restored name path");
+        assert_eq!(restored_names, target_names);
     }
 
     #[test]

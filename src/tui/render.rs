@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::{
     model::{SymbolKind, SymbolNode},
+    query::{Expr, PredicateKey},
     tree::{VisibleNode, get_node},
 };
 
@@ -18,6 +19,20 @@ use super::{App, GlyphMode, LOADING_INDICATOR_DELAY, Mode, PreviewRequest};
 
 const SCROLLOFF: usize = 5;
 
+fn clamp_overlay_scroll(app: &App, total_lines: usize, popup_height: u16) -> u16 {
+    let inner = popup_height.saturating_sub(2) as usize;
+    let max = total_lines.saturating_sub(inner);
+    app.overlay_scroll.min(max) as u16
+}
+
+fn fit_overlay_height(area: Rect, content_lines: usize) -> u16 {
+    let content = u16::try_from(content_lines).unwrap_or(u16::MAX);
+    content
+        .saturating_add(2)
+        .min(area.height.saturating_sub(2))
+        .max(3)
+}
+
 pub(super) fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     if area.width < 40 || area.height < 8 {
@@ -25,17 +40,24 @@ pub(super) fn render(frame: &mut Frame, app: &mut App) {
         return;
     }
 
+    let footer_rows: u16 = if app.query.is_some() { 3 } else { 2 };
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(2)])
+        .constraints([Constraint::Min(3), Constraint::Length(footer_rows)])
         .split(area);
 
     render_body(frame, app, sections[0]);
     let (_, footer) = crate::timed!(render_footer(frame, app, sections[1]));
     app.perf.borrow_mut().record_render_footer(footer);
 
+    if matches!(app.mode, Mode::Search | Mode::Command) {
+        render_autocomplete(frame, app, sections[1]);
+    }
+
     if app.show_help {
         render_help(frame, app, area);
+    } else if app.show_keymap {
+        render_keymap(frame, app, area);
     } else if app.show_warnings {
         render_warnings(frame, app, area);
     } else if app.show_lsp {
@@ -46,6 +68,72 @@ pub(super) fn render(frame: &mut Frame, app: &mut App) {
             render_perf(frame, app, area);
         }
     }
+}
+
+fn render_autocomplete(frame: &mut Frame, app: &App, footer_area: Rect) {
+    let candidates = match app.mode {
+        Mode::Search => super::autocomplete::search_candidates(app),
+        Mode::Command => super::autocomplete::command_candidates(app),
+        Mode::Normal => return,
+    };
+    if candidates.is_empty() {
+        return;
+    }
+
+    let visible_count = candidates.len().min(8) as u16;
+    let max_width = candidates
+        .iter()
+        .map(|c| c.chars().count())
+        .max()
+        .unwrap_or(0) as u16;
+    let box_w = max_width.saturating_add(2).min(footer_area.width);
+    let box_h = visible_count;
+
+    if footer_area.y < box_h {
+        return;
+    }
+    let rect = Rect {
+        x: footer_area.x,
+        y: footer_area.y.saturating_sub(box_h),
+        width: box_w,
+        height: box_h,
+    };
+
+    let selected = app.candidate_index.min(candidates.len().saturating_sub(1));
+    let inner_w = box_w as usize;
+    let popup_bg = Color::Indexed(236);
+    let selected_bg = Color::Indexed(240);
+
+    let lines: Vec<Line<'static>> = candidates
+        .iter()
+        .enumerate()
+        .take(visible_count as usize)
+        .map(|(i, c)| {
+            let is_selected = i == selected;
+            let bg = if is_selected { selected_bg } else { popup_bg };
+            let fg = if is_selected {
+                Color::White
+            } else {
+                Color::Indexed(250)
+            };
+            let mut text = format!(" {c}");
+            let used = text.chars().count();
+            if used < inner_w {
+                text.push_str(&" ".repeat(inner_w - used));
+            }
+            let mut style = Style::default().fg(fg).bg(bg);
+            if is_selected {
+                style = style.bold();
+            }
+            Line::from(Span::styled(text, style))
+        })
+        .collect();
+
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(popup_bg)),
+        rect,
+    );
 }
 
 pub(super) fn render_too_small(frame: &mut Frame, area: Rect) {
@@ -509,29 +597,117 @@ pub(super) fn selected_detail_lines(app: &App, node: &SymbolNode) -> Vec<Line<'s
 }
 
 pub(super) fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
+    let has_query = app.query.is_some();
+    let constraints: Vec<Constraint> = if has_query {
+        vec![
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ]
+    } else {
+        vec![Constraint::Length(1), Constraint::Length(1)]
+    };
     let lines = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .constraints(constraints)
         .split(area);
+
+    let (status_row, command_row) = if has_query {
+        let query_spans = query_status_line(app);
+        frame.render_widget(
+            Paragraph::new(Line::from(query_spans)).style(status_bar_style()),
+            lines[0],
+        );
+        (1, 2)
+    } else {
+        (0, 1)
+    };
+
     frame.render_widget(
-        Paragraph::new(status_line(app, lines[0].width)).style(status_bar_style()),
-        lines[0],
+        Paragraph::new(status_line(app, lines[status_row].width)).style(status_bar_style()),
+        lines[status_row],
     );
-    frame.render_widget(Paragraph::new(command_line(app)), lines[1]);
+    frame.render_widget(Paragraph::new(command_line(app)), lines[command_row]);
+}
+
+fn query_status_line(app: &App) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(
+        " query: ",
+        status_bar_style().fg(Color::White).bold(),
+    )];
+    if let Some(expr) = app.query.as_ref() {
+        render_expr_spans(expr, &mut spans);
+    }
+    spans
+}
+
+fn render_expr_spans(expr: &Expr, out: &mut Vec<Span<'static>>) {
+    match expr {
+        Expr::Or(items) => {
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(Span::styled(
+                        " || ",
+                        status_bar_style().fg(Color::Indexed(244)),
+                    ));
+                }
+                render_expr_spans(item, out);
+            }
+        }
+        Expr::And(items) => {
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(Span::styled(" ", status_bar_style()));
+                }
+                render_expr_spans(item, out);
+            }
+        }
+        Expr::Not(inner) => {
+            out.push(Span::styled("!", status_bar_style().fg(Color::Red).bold()));
+            render_expr_spans(inner, out);
+        }
+        Expr::Predicate { key, value } => {
+            let color = predicate_color(*key);
+            out.push(Span::styled(
+                format!("{}:", key.as_str()),
+                status_bar_style().fg(color).bold(),
+            ));
+            out.push(Span::styled(value.clone(), status_bar_style().fg(color)));
+        }
+        Expr::Text { pattern, regex } => {
+            let text = if regex.is_some() {
+                format!("\"{pattern}\"")
+            } else {
+                pattern.clone()
+            };
+            out.push(Span::styled(text, status_bar_style().fg(Color::White)));
+        }
+    }
+}
+
+fn predicate_color(key: PredicateKey) -> Color {
+    match key {
+        PredicateKey::Lang => Color::Cyan,
+        PredicateKey::Kind => Color::Green,
+        PredicateKey::File => Color::Blue,
+        PredicateKey::Name => Color::White,
+    }
 }
 
 pub(super) fn command_line(app: &App) -> Line<'static> {
     match app.mode {
-        Mode::Search => Line::from(vec![
-            Span::styled("/", Style::default().fg(Color::Yellow).bold()),
-            Span::styled(app.filter.clone(), Style::default().fg(Color::White)),
-            command_cursor(),
-        ]),
-        Mode::Command => Line::from(vec![
-            Span::styled(":", Style::default().fg(Color::Cyan).bold()),
-            Span::styled(app.command.clone(), Style::default().fg(Color::White)),
-            command_cursor(),
-        ]),
+        Mode::Search => build_input_line(
+            "/",
+            Style::default().fg(Color::Yellow).bold(),
+            &app.filter,
+            app.cursor_pos,
+        ),
+        Mode::Command => build_input_line(
+            ":",
+            Style::default().fg(Color::Cyan).bold(),
+            &app.command,
+            app.cursor_pos,
+        ),
         Mode::Normal if app.message.is_empty() => Line::raw(""),
         Mode::Normal => Line::from(Span::styled(
             app.message.clone(),
@@ -540,8 +716,25 @@ pub(super) fn command_line(app: &App) -> Line<'static> {
     }
 }
 
-pub(super) fn command_cursor() -> Span<'static> {
-    Span::styled(" ", Style::default().bg(Color::White))
+fn build_input_line(prefix: &str, prefix_style: Style, text: &str, cursor: usize) -> Line<'static> {
+    let chars: Vec<char> = text.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let before: String = chars[..cursor].iter().collect();
+    let cursor_style = Style::default().fg(Color::Black).bg(Color::White);
+    let mut spans = vec![
+        Span::styled(prefix.to_string(), prefix_style),
+        Span::styled(before, Style::default().fg(Color::White)),
+    ];
+    if cursor < chars.len() {
+        spans.push(Span::styled(chars[cursor].to_string(), cursor_style));
+        let after: String = chars[cursor + 1..].iter().collect();
+        if !after.is_empty() {
+            spans.push(Span::styled(after, Style::default().fg(Color::White)));
+        }
+    } else {
+        spans.push(Span::styled(" ", cursor_style));
+    }
+    Line::from(spans)
 }
 
 pub(super) fn status_bar_style() -> Style {
@@ -571,7 +764,6 @@ pub(super) fn truncate_left(text: &str, max_width: usize) -> String {
 }
 #[cfg(feature = "debug_perf")]
 pub(super) fn render_perf(frame: &mut Frame, app: &App, area: Rect) {
-    let popup = centered_rect(area, 70, area.height.saturating_sub(4));
     let perf = app.perf.borrow();
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -616,13 +808,9 @@ pub(super) fn render_perf(frame: &mut Frame, app: &App, area: Rect) {
     lines.push(section("Load events"));
     lines.push(row("total drained", perf.load_events_drained.to_string()));
     lines.push(row("last drain size", perf.last_drain_size.to_string()));
-    lines.push(Line::raw(""));
 
-    lines.push(Line::from(Span::styled(
-        "Esc / Enter / q      close      |      :perf reset",
-        Style::default().fg(Color::DarkGray),
-    )));
-
+    let popup = centered_rect(area, 70, fit_overlay_height(area, lines.len()));
+    let scroll = clamp_overlay_scroll(app, lines.len(), popup.height);
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
@@ -632,7 +820,8 @@ pub(super) fn render_perf(frame: &mut Frame, app: &App, area: Rect) {
                     .borders(Borders::ALL)
                     .border_set(border_set(app.glyph_mode)),
             )
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
         popup,
     );
 }
@@ -650,7 +839,6 @@ fn format_duration(d: Duration) -> String {
 }
 
 pub(super) fn render_warnings(frame: &mut Frame, app: &App, area: Rect) {
-    let popup = centered_rect(area, 80, area.height.saturating_sub(4));
     let mut lines: Vec<Line<'static>> = Vec::new();
     if app.project.warnings.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -665,12 +853,9 @@ pub(super) fn render_warnings(frame: &mut Frame, app: &App, area: Rect) {
             ]));
         }
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        "Esc / Enter / q      close",
-        Style::default().fg(Color::DarkGray),
-    )));
 
+    let popup = centered_rect(area, 80, fit_overlay_height(area, lines.len()));
+    let scroll = clamp_overlay_scroll(app, lines.len(), popup.height);
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
@@ -680,13 +865,13 @@ pub(super) fn render_warnings(frame: &mut Frame, app: &App, area: Rect) {
                     .borders(Borders::ALL)
                     .border_set(border_set(app.glyph_mode)),
             )
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
         popup,
     );
 }
 
 pub(super) fn render_lsp(frame: &mut Frame, app: &App, area: Rect) {
-    let popup = centered_rect(area, 80, area.height.saturating_sub(4));
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     lines.push(Line::from(Span::styled(
@@ -745,12 +930,8 @@ pub(super) fn render_lsp(frame: &mut Frame, app: &App, area: Rect) {
         )));
     }
 
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        "Esc / Enter / q      close",
-        Style::default().fg(Color::DarkGray),
-    )));
-
+    let popup = centered_rect(area, 80, fit_overlay_height(area, lines.len()));
+    let scroll = clamp_overlay_scroll(app, lines.len(), popup.height);
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
@@ -760,44 +941,97 @@ pub(super) fn render_lsp(frame: &mut Frame, app: &App, area: Rect) {
                     .borders(Borders::ALL)
                     .border_set(border_set(app.glyph_mode)),
             )
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
         popup,
     );
 }
 
+#[allow(clippy::vec_init_then_push)]
 pub(super) fn render_help(frame: &mut Frame, app: &App, area: Rect) {
-    let popup = centered_rect(area, 70, 15);
-    let lines = vec![
+    let section = |title: &str| {
         Line::from(Span::styled(
-            "Navigation",
+            title.to_string(),
             Style::default().fg(Color::Cyan).bold(),
-        )),
-        Line::from("  j/k, Up/Down       move row"),
-        Line::from("  J/K                move 3 rows"),
-        Line::from("  h/l, Left/Right    parent / first child"),
-        Line::from("  u/i                next / previous sibling"),
-        Line::from(""),
+        ))
+    };
+    let cmd = |name: &str, desc: &str| {
+        Line::from(vec![
+            Span::styled(
+                format!("  :{name:<20}"),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(desc.to_string(), Style::default().fg(Color::Gray)),
+        ])
+    };
+    let example = |line: &str| {
         Line::from(Span::styled(
-            "Actions",
-            Style::default().fg(Color::Cyan).bold(),
-        )),
-        Line::from("  Enter/Space        toggle branch"),
-        Line::from("  /                  filter symbols"),
-        Line::from("  :help              show this help"),
-        Line::from("  :warnings          list load warnings"),
-        Line::from("  :lsp               list LSP languages"),
-        Line::from("  :collapse          collapse every node"),
-        Line::from("  :expand            expand every node"),
-        Line::from("  o                  open selected in $EDITOR"),
-        Line::from("  r                  reload symbols"),
-        Line::from("  q  /  :q           quit"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Esc / Enter / q      close",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
+            format!("  {line}"),
+            Style::default().fg(Color::Gray),
+        ))
+    };
 
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    lines.push(section("Overview"));
+    lines.push(Line::from(Span::styled(
+        "  symtree — multi-language symbol-tree browser",
+        Style::default().fg(Color::Gray),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  Use :keymap for key bindings",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::raw(""));
+
+    lines.push(section("Commands"));
+    lines.push(cmd("help", "show this page"));
+    lines.push(cmd("keymap", "show key bindings"));
+    lines.push(cmd("warnings", "list load warnings (alias: :w)"));
+    lines.push(cmd("lsp", "list configured LSPs and status"));
+    #[cfg(feature = "debug_perf")]
+    lines.push(cmd("perf", "performance stats (:perf reset)"));
+    lines.push(cmd("collapse", "collapse every node"));
+    lines.push(cmd("expand", "expand every node"));
+    lines.push(cmd("query EXPR", "filter symbols (see Query)"));
+    lines.push(cmd("query", "edit current query / :query clear"));
+    lines.push(cmd("q | quit", "exit symtree"));
+    lines.push(Line::raw(""));
+
+    lines.push(section("Query language"));
+    lines.push(Line::from(Span::styled(
+        "  Predicates:  lang:<id>  kind:<k>  file:<sub>  name:<sub>",
+        Style::default().fg(Color::Gray),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  Bare word = case-insensitive substring on name",
+        Style::default().fg(Color::Gray),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  Quoted   = regex, e.g. \"^handle_.*\"",
+        Style::default().fg(Color::Gray),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  Operators: implicit AND  ·  ||  OR  ·  ! negation",
+        Style::default().fg(Color::Gray),
+    )));
+    lines.push(Line::raw(""));
+
+    lines.push(section("Examples"));
+    lines.push(example(":query lang:rust kind:fn"));
+    lines.push(example(":query lang:rust || lang:python"));
+    lines.push(example(":query !kind:fn \"^handle_\""));
+    lines.push(example(":query file:src/tui name:render"));
+    lines.push(Line::raw(""));
+
+    lines.push(section("Environment"));
+    lines.push(Line::from(Span::styled(
+        "  LSP_SEARCH_PATH    prepended to PATH for LSP binaries",
+        Style::default().fg(Color::Gray),
+    )));
+
+    let popup = centered_rect(area, 70, fit_overlay_height(area, lines.len()));
+    let scroll = clamp_overlay_scroll(app, lines.len(), popup.height);
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
@@ -807,7 +1041,75 @@ pub(super) fn render_help(frame: &mut Frame, app: &App, area: Rect) {
                     .borders(Borders::ALL)
                     .border_set(border_set(app.glyph_mode)),
             )
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        popup,
+    );
+}
+
+#[allow(clippy::vec_init_then_push)]
+pub(super) fn render_keymap(frame: &mut Frame, app: &App, area: Rect) {
+    let section = |title: &str| {
+        Line::from(Span::styled(
+            title.to_string(),
+            Style::default().fg(Color::Cyan).bold(),
+        ))
+    };
+    let bind = |keys: &str, desc: &str| {
+        Line::from(vec![
+            Span::styled(format!("  {keys:<22}"), Style::default().fg(Color::White)),
+            Span::styled(desc.to_string(), Style::default().fg(Color::Gray)),
+        ])
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    lines.push(section("Tree navigation"));
+    lines.push(bind("j / k", "move down / up one row"));
+    lines.push(bind("Down / Up", "same as j / k"));
+    lines.push(bind("J / K", "move 3 rows"));
+    lines.push(bind("PageDown / PageUp", "scroll one page"));
+    lines.push(bind("Home / End", "first / last visible row"));
+    lines.push(bind("h / Left", "jump to parent"));
+    lines.push(bind("l / Right", "jump to first child"));
+    lines.push(bind("u / i", "previous / next sibling"));
+    lines.push(bind("Enter / Space", "toggle branch expand/collapse"));
+    lines.push(Line::raw(""));
+
+    lines.push(section("Actions"));
+    lines.push(bind("/", "filter (live, applied as you type)"));
+    lines.push(bind(":", "command prompt"));
+    lines.push(bind("o", "open selection in $EDITOR"));
+    lines.push(bind("r", "reload symbols"));
+    lines.push(bind("q  /  Ctrl-C", "quit"));
+    lines.push(Line::raw(""));
+
+    lines.push(section("Prompt editing  (/ and :)"));
+    lines.push(bind("Left / Right", "move cursor one char"));
+    lines.push(bind("Home / Ctrl-A", "cursor to start"));
+    lines.push(bind("End / Ctrl-E", "cursor to end"));
+    lines.push(bind("Ctrl-Left/Right", "jump by word"));
+    lines.push(bind("Backspace / Del", "delete before / at cursor"));
+    lines.push(bind("Ctrl-U", "clear buffer"));
+    lines.push(bind("Tab", "accept autocomplete candidate"));
+    lines.push(bind("Up / Down", "select candidate"));
+    lines.push(bind("Enter", "submit"));
+    lines.push(bind("Esc", "cancel"));
+    lines.push(Line::raw(""));
+
+    let popup = centered_rect(area, 70, fit_overlay_height(area, lines.len()));
+    let scroll = clamp_overlay_scroll(app, lines.len(), popup.height);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(" Keymap ")
+                    .borders(Borders::ALL)
+                    .border_set(border_set(app.glyph_mode)),
+            )
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
         popup,
     );
 }

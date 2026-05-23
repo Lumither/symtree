@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
+use crate::languages;
 use crate::model::SymbolNode;
+use crate::query::{Expr, MatchCtx};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VisibleNode {
@@ -18,14 +20,14 @@ pub struct SelectionTarget {
     pub label: String,
 }
 
-pub fn flatten_visible(nodes: &[SymbolNode], filter: &str) -> Vec<VisibleNode> {
-    let filter = normalized_filter(filter);
+pub fn flatten_visible(nodes: &[SymbolNode], query: Option<&Expr>) -> Vec<VisibleNode> {
     let mut visible = Vec::new();
     let mut path = Vec::new();
     let mut ancestor_is_last = Vec::new();
     append_visible_nodes(
         nodes,
-        filter.as_deref(),
+        query,
+        None,
         &mut path,
         &mut ancestor_is_last,
         &mut visible,
@@ -71,7 +73,8 @@ pub fn selection_target(
 
 fn append_visible_nodes(
     nodes: &[SymbolNode],
-    filter: Option<&str>,
+    query: Option<&Expr>,
+    file_path: Option<&str>,
     path: &mut Vec<usize>,
     ancestor_is_last: &mut Vec<bool>,
     visible: &mut Vec<VisibleNode>,
@@ -79,12 +82,16 @@ fn append_visible_nodes(
     let included_indices: Vec<usize> = nodes
         .iter()
         .enumerate()
-        .filter_map(|(index, node)| should_include(node, filter).then_some(index))
+        .filter_map(|(index, node)| {
+            let child_file_path = file_path.unwrap_or(node.name.as_str());
+            should_include(node, child_file_path, query).then_some(index)
+        })
         .collect();
 
     for (visible_index, node_index) in included_indices.iter().enumerate() {
         let node = &nodes[*node_index];
         let is_last = visible_index + 1 == included_indices.len();
+        let child_file_path = file_path.unwrap_or(node.name.as_str());
 
         path.push(*node_index);
         visible.push(VisibleNode {
@@ -92,17 +99,20 @@ fn append_visible_nodes(
             depth: path.len().saturating_sub(1),
             is_last,
             ancestor_is_last: ancestor_is_last.clone(),
-            matched: filter.is_some_and(|filter| node_matches(node, filter)),
+            matched: query.is_some_and(|q| node_matches(node, child_file_path, q)),
         });
 
-        let should_descend = if filter.is_some() {
-            true
-        } else {
-            node.expanded
-        };
+        let should_descend = if query.is_some() { true } else { node.expanded };
         if should_descend {
             ancestor_is_last.push(is_last);
-            append_visible_nodes(&node.children, filter, path, ancestor_is_last, visible);
+            append_visible_nodes(
+                &node.children,
+                query,
+                Some(child_file_path),
+                path,
+                ancestor_is_last,
+                visible,
+            );
             ancestor_is_last.pop();
         }
 
@@ -110,31 +120,28 @@ fn append_visible_nodes(
     }
 }
 
-fn should_include(node: &SymbolNode, filter: Option<&str>) -> bool {
-    match filter {
-        Some(filter) => {
-            node_matches(node, filter)
+fn should_include(node: &SymbolNode, file_path: &str, query: Option<&Expr>) -> bool {
+    match query {
+        Some(q) => {
+            node_matches(node, file_path, q)
                 || node
                     .children
                     .iter()
-                    .any(|child| should_include(child, Some(filter)))
+                    .any(|child| should_include(child, file_path, Some(q)))
         }
         None => true,
     }
 }
 
-fn node_matches(node: &SymbolNode, filter: &str) -> bool {
-    node.name.to_lowercase().contains(filter)
-        || node.kind.short_label().contains(filter)
-        || node
-            .detail
-            .as_ref()
-            .is_some_and(|detail| detail.to_lowercase().contains(filter))
-}
-
-fn normalized_filter(filter: &str) -> Option<String> {
-    let filter = filter.trim().to_lowercase();
-    (!filter.is_empty()).then_some(filter)
+fn node_matches(node: &SymbolNode, file_path: &str, query: &Expr) -> bool {
+    let lang = languages::lang_for_path(file_path);
+    let ctx = MatchCtx {
+        name: &node.name,
+        kind: node.kind.short_label(),
+        file_path,
+        lang,
+    };
+    query.matches(&ctx)
 }
 
 #[cfg(test)]
@@ -163,7 +170,7 @@ mod tests {
         root.expanded = true;
         root.children[0].expanded = false;
 
-        let visible = flatten_visible(&[root], "");
+        let visible = flatten_visible(&[root], None);
 
         assert_eq!(visible.len(), 2);
         assert_eq!(visible[0].path, vec![0]);
@@ -189,7 +196,8 @@ mod tests {
             )],
         );
 
-        let visible = flatten_visible(&[root], "needle");
+        let expr = crate::query::parse("needle").unwrap().unwrap();
+        let visible = flatten_visible(&[root], Some(&expr));
 
         assert_eq!(
             visible
