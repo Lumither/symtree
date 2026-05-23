@@ -160,6 +160,7 @@ mod tests {
                 )],
             )],
         );
+        root.expanded = true;
         root.children[0].expanded = false;
 
         let visible = flatten_visible(&[root], "");

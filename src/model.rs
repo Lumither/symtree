@@ -49,7 +49,9 @@ impl SymbolNode {
     }
 
     pub fn file(name: impl Into<String>, children: Vec<SymbolNode>) -> Self {
-        Self::new(name, SymbolKind::File, None, None, children)
+        let mut node = Self::new(name, SymbolKind::File, None, None, children);
+        node.expanded = false;
+        node
     }
 
     pub fn has_children(&self) -> bool {

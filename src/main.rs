@@ -28,8 +28,12 @@ fn run() -> AppResult<()> {
         .root
         .canonicalize()
         .with_context(|| format!("failed to resolve project root {}", args.root.display()))?;
-    let symbols = lsp::load_project_symbols(&root, &args.languages)?;
-    tui::run(root, args.languages, args.glyph_mode, symbols)
+    let empty = model::ProjectSymbols {
+        root: root.clone(),
+        files: Vec::new(),
+        warnings: Vec::new(),
+    };
+    tui::run(root, args.languages, args.glyph_mode, empty)
 }
 
 #[derive(Debug)]

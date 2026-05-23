@@ -2,42 +2,98 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
+
+const DOCUMENT_SYMBOLS_TIMEOUT: Duration = Duration::from_secs(15);
 
 use serde_json::{Value, json};
 
 use crate::{
     error::{AppContext, AppResult, app_error},
     languages::{LanguageDef, lsp_program},
-    model::{ProjectSymbols, SymbolKind, SymbolNode},
+    model::{SymbolKind, SymbolNode},
     project::collect_source_files,
 };
 
-pub fn load_project_symbols(root: &Path, languages: &[LanguageDef]) -> AppResult<ProjectSymbols> {
-    let mut files = Vec::new();
-    let mut warnings = Vec::new();
-    let probing_registry = languages.len() > 1;
+pub enum LoadEvent {
+    Started,
+    Discovered(usize),
+    FileLoaded(SymbolNode),
+    Warning(String),
+    Finished,
+}
 
-    for lang in languages {
-        if probing_registry && !lsp_is_available(&lang.lsp) {
+pub fn stream_language(root: &Path, lang: &LanguageDef, tx: Sender<LoadEvent>) {
+    let warn = |tx: &Sender<LoadEvent>, msg: String| {
+        let _ = tx.send(LoadEvent::Warning(msg));
+    };
+    let lang_label = lsp_program(&lang.lsp).to_string();
+
+    let files = match collect_source_files(root, &lang.extensions) {
+        Ok(f) => f,
+        Err(error) => {
+            warn(&tx, format!("{lang_label}: {error}"));
+            return;
+        }
+    };
+    if files.is_empty() {
+        return;
+    }
+    let _ = tx.send(LoadEvent::Discovered(files.len()));
+
+    let root_uri = file_uri(root);
+    let root_name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace")
+        .to_string();
+
+    let mut client = match LspClient::spawn(&lang.lsp, root_uri.clone(), root_name.clone()) {
+        Ok(c) => c,
+        Err(error) => {
+            warn(&tx, format!("{lang_label}: {error}"));
+            return;
+        }
+    };
+    if let Err(error) = client.initialize(root, &root_uri, &root_name) {
+        warn(&tx, format!("{lang_label}: initialize: {error}"));
+        return;
+    }
+
+    let language_id = lang.language_id.as_deref().unwrap_or("plaintext");
+    for file in files {
+        let relative_name = relative_path(root, &file);
+        let text = match std::fs::read_to_string(&file) {
+            Ok(text) => text,
+            Err(error) => {
+                warn(&tx, format!("{}: {error}", file.display()));
+                continue;
+            }
+        };
+
+        let uri = file_uri(&file);
+        if let Err(error) = client.did_open(&uri, &text, language_id) {
+            warn(&tx, format!("{relative_name}: did_open: {error}"));
             continue;
         }
-        match load_symbols_for_language(root, lang) {
-            Ok(mut partial) => {
-                files.append(&mut partial.files);
-                warnings.append(&mut partial.warnings);
+
+        match client.document_symbols(&uri) {
+            Ok(symbols) => {
+                let _ = tx.send(LoadEvent::FileLoaded(SymbolNode::file(
+                    relative_name,
+                    symbols,
+                )));
             }
             Err(error) => {
-                warnings.push(format!("{}: {error}", lsp_program(&lang.lsp)));
+                warn(&tx, format!("{relative_name}: symbols: {error}"));
             }
         }
     }
 
-    Ok(ProjectSymbols {
-        root: root.to_path_buf(),
-        files,
-        warnings,
-    })
+    client.shutdown();
 }
 
 pub fn lsp_is_available(command: &str) -> bool {
@@ -51,67 +107,11 @@ pub fn lsp_is_available(command: &str) -> bool {
         .any(|dir| Path::new(dir).join(program).is_file())
 }
 
-fn load_symbols_for_language(root: &Path, lang: &LanguageDef) -> AppResult<ProjectSymbols> {
-    let source_files = collect_source_files(root, &lang.extensions)?;
-    if source_files.is_empty() {
-        return Ok(ProjectSymbols {
-            root: root.to_path_buf(),
-            files: Vec::new(),
-            warnings: Vec::new(),
-        });
-    }
-
-    let root_uri = file_uri(root);
-    let root_name = root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("workspace")
-        .to_string();
-
-    let mut client = LspClient::spawn(&lang.lsp, root_uri.clone(), root_name.clone())?;
-    client.initialize(root, &root_uri, &root_name)?;
-
-    let language_id = lang.language_id.as_deref().unwrap_or("plaintext");
-    let mut files = Vec::new();
-    let mut warnings = Vec::new();
-
-    for file in source_files {
-        let relative_name = relative_path(root, &file);
-        let text = match std::fs::read_to_string(&file) {
-            Ok(text) => text,
-            Err(error) => {
-                warnings.push(format!("{}: failed to read file: {error}", file.display()));
-                continue;
-            }
-        };
-
-        let uri = file_uri(&file);
-        if let Err(error) = client.did_open(&uri, &text, language_id) {
-            warnings.push(format!("{relative_name}: failed to open in LSP: {error}"));
-            continue;
-        }
-
-        match client.document_symbols(&uri) {
-            Ok(symbols) => files.push(SymbolNode::file(relative_name, symbols)),
-            Err(error) => {
-                warnings.push(format!("{relative_name}: failed to load symbols: {error}"))
-            }
-        }
-    }
-
-    client.shutdown();
-
-    Ok(ProjectSymbols {
-        root: root.to_path_buf(),
-        files,
-        warnings,
-    })
-}
-
 struct LspClient {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    incoming_rx: Receiver<AppResult<Value>>,
+    _reader_handle: Option<JoinHandle<()>>,
     next_id: i64,
     root_uri: String,
     root_name: String,
@@ -141,10 +141,29 @@ impl LspClient {
             .take()
             .ok_or_else(|| app_error("failed to capture LSP stdout"))?;
 
+        let (tx, incoming_rx) = mpsc::channel::<AppResult<Value>>();
+        let reader_handle = thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                match read_lsp_message(&mut reader) {
+                    Ok(message) => {
+                        if tx.send(Ok(message)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Err(error));
+                        break;
+                    }
+                }
+            }
+        });
+
         Ok(Self {
             child,
             stdin,
-            stdout: BufReader::new(stdout),
+            incoming_rx,
+            _reader_handle: Some(reader_handle),
             next_id: 1,
             root_uri,
             root_name,
@@ -197,19 +216,38 @@ impl LspClient {
     }
 
     fn document_symbols(&mut self, uri: &str) -> AppResult<Vec<SymbolNode>> {
-        let result = self.request(
+        let result = self.request_with_timeout(
             "textDocument/documentSymbol",
             json!({
                 "textDocument": {
                     "uri": uri
                 }
             }),
+            DOCUMENT_SYMBOLS_TIMEOUT,
         )?;
 
         Ok(parse_symbols(&result))
     }
 
     fn request(&mut self, method: &str, params: Value) -> AppResult<Value> {
+        self.request_inner(method, params, None)
+    }
+
+    fn request_with_timeout(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> AppResult<Value> {
+        self.request_inner(method, params, Some(timeout))
+    }
+
+    fn request_inner(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Option<Duration>,
+    ) -> AppResult<Value> {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -220,8 +258,9 @@ impl LspClient {
             "params": params
         }))?;
 
+        let deadline = timeout.map(|t| Instant::now() + t);
         loop {
-            let message = self.read_message()?;
+            let message = self.recv_message(deadline, method)?;
 
             if is_response_for(&message, id) {
                 if let Some(error) = message.get("error") {
@@ -243,6 +282,36 @@ impl LspClient {
         }
     }
 
+    fn recv_message(&self, deadline: Option<Instant>, method: &str) -> AppResult<Value> {
+        match deadline {
+            Some(d) => {
+                let remaining = d.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(app_error(format!(
+                        "LSP request `{method}` timed out after {:?}",
+                        DOCUMENT_SYMBOLS_TIMEOUT
+                    )));
+                }
+                match self.incoming_rx.recv_timeout(remaining) {
+                    Ok(Ok(msg)) => Ok(msg),
+                    Ok(Err(e)) => Err(e),
+                    Err(RecvTimeoutError::Timeout) => Err(app_error(format!(
+                        "LSP request `{method}` timed out after {:?}",
+                        DOCUMENT_SYMBOLS_TIMEOUT
+                    ))),
+                    Err(RecvTimeoutError::Disconnected) => {
+                        Err(app_error("LSP server closed connection"))
+                    }
+                }
+            }
+            None => match self.incoming_rx.recv() {
+                Ok(Ok(msg)) => Ok(msg),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(app_error("LSP server closed connection")),
+            },
+        }
+    }
+
     fn notify(&mut self, method: &str, params: Value) -> AppResult<()> {
         self.send(json!({
             "jsonrpc": "2.0",
@@ -259,47 +328,6 @@ impl LspClient {
             .write_all(&body)
             .context("failed to write LSP body")?;
         self.stdin.flush().context("failed to flush LSP message")
-    }
-
-    fn read_message(&mut self) -> AppResult<Value> {
-        let mut content_length = None;
-
-        loop {
-            let mut line = String::new();
-            let read = self
-                .stdout
-                .read_line(&mut line)
-                .context("failed to read LSP header")?;
-            if read == 0 {
-                return Err(app_error("LSP server closed stdout"));
-            }
-
-            let line = line.trim_end_matches(['\r', '\n']);
-            if line.is_empty() {
-                break;
-            }
-
-            let Some((name, value)) = line.split_once(':') else {
-                continue;
-            };
-
-            if name.eq_ignore_ascii_case("Content-Length") {
-                content_length = Some(
-                    value
-                        .trim()
-                        .parse::<usize>()
-                        .context("invalid LSP Content-Length")?,
-                );
-            }
-        }
-
-        let length =
-            content_length.ok_or_else(|| app_error("LSP response missing Content-Length"))?;
-        let mut body = vec![0; length];
-        self.stdout
-            .read_exact(&mut body)
-            .context("failed to read LSP body")?;
-        serde_json::from_slice(&body).context("failed to parse LSP JSON")
     }
 
     fn respond_to_server_request(&mut self, request: &Value) -> AppResult<()> {
@@ -418,6 +446,45 @@ fn parse_symbol_information(value: &Value) -> Option<SymbolNode> {
         .map(|container| format!("in {container}"));
 
     Some(SymbolNode::new(name, kind, line, detail, Vec::new()))
+}
+
+fn read_lsp_message(reader: &mut BufReader<ChildStdout>) -> AppResult<Value> {
+    let mut content_length = None;
+
+    loop {
+        let mut line = String::new();
+        let read = reader
+            .read_line(&mut line)
+            .context("failed to read LSP header")?;
+        if read == 0 {
+            return Err(app_error("LSP server closed stdout"));
+        }
+
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            break;
+        }
+
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+
+        if name.eq_ignore_ascii_case("Content-Length") {
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .context("invalid LSP Content-Length")?,
+            );
+        }
+    }
+
+    let length = content_length.ok_or_else(|| app_error("LSP response missing Content-Length"))?;
+    let mut body = vec![0; length];
+    reader
+        .read_exact(&mut body)
+        .context("failed to read LSP body")?;
+    serde_json::from_slice(&body).context("failed to parse LSP JSON")
 }
 
 fn relative_path(root: &Path, path: &Path) -> String {

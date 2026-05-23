@@ -127,21 +127,57 @@ pub(super) fn preferred_details_height(app: &App, max: u16) -> u16 {
 }
 
 pub(super) fn render_tree(frame: &mut Frame, app: &mut App, area: Rect) {
-    let visible = app.visible_nodes();
+    let inner_height = area.height.saturating_sub(2) as usize;
     let glyphs = Glyphs::new(app.glyph_mode);
-    let items = visible
-        .iter()
-        .enumerate()
-        .map(|(index, visible_node)| {
-            render_tree_item(app, visible_node, glyphs, index == app.selected)
-        })
-        .collect::<Vec<_>>();
+    let visible_len = app.visible_nodes().len();
+
+    let viewport_start = if visible_len == 0 || inner_height == 0 {
+        0
+    } else {
+        let max_offset = visible_len.saturating_sub(inner_height);
+        if app.center_selection_pending {
+            app.selected
+                .saturating_sub(inner_height / 2)
+                .min(max_offset)
+        } else {
+            let scrolloff = SCROLLOFF.min(inner_height.saturating_sub(1) / 2);
+            let lower = (app.selected + scrolloff + 1).saturating_sub(inner_height);
+            let upper = app.selected.saturating_sub(scrolloff);
+            let current = app.scroll_offset;
+            current.max(lower).min(upper).min(max_offset)
+        }
+    };
+    let viewport_end = (viewport_start + inner_height).min(visible_len);
+    app.scroll_offset = viewport_start;
+    app.center_selection_pending = false;
+
+    *app.list_state.offset_mut() = 0;
+    let relative_selected =
+        if visible_len > 0 && app.selected >= viewport_start && app.selected < viewport_end {
+            Some(app.selected - viewport_start)
+        } else {
+            None
+        };
+    app.list_state.select(relative_selected);
 
     let title = if app.filter.is_empty() {
         " Symbols ".to_string()
     } else {
         format!(" Symbols matching `{}` ", app.filter)
     };
+
+    let items: Vec<ListItem> = {
+        let visible = app.visible_nodes();
+        visible[viewport_start..viewport_end]
+            .iter()
+            .enumerate()
+            .map(|(i, vn)| {
+                let absolute = viewport_start + i;
+                render_tree_item(app, vn, glyphs, absolute == app.selected)
+            })
+            .collect()
+    };
+
     let list = List::new(items)
         .block(
             Block::default()
@@ -152,29 +188,6 @@ pub(super) fn render_tree(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol(glyphs.selection_line())
         .highlight_style(selected_row_style())
         .repeat_highlight_symbol(true);
-
-    app.list_state
-        .select((!visible.is_empty()).then_some(app.selected));
-
-    let inner_height = area.height.saturating_sub(2) as usize;
-    if !visible.is_empty() && inner_height > 0 {
-        let max_offset = visible.len().saturating_sub(inner_height);
-        if app.center_selection_pending {
-            let offset = app
-                .selected
-                .saturating_sub(inner_height / 2)
-                .min(max_offset);
-            *app.list_state.offset_mut() = offset;
-            app.center_selection_pending = false;
-        } else {
-            let scrolloff = SCROLLOFF.min(inner_height.saturating_sub(1) / 2);
-            let lower = (app.selected + scrolloff + 1).saturating_sub(inner_height);
-            let upper = app.selected.saturating_sub(scrolloff);
-            let current = app.list_state.offset();
-            let clamped = current.max(lower).min(upper).min(max_offset);
-            *app.list_state.offset_mut() = clamped;
-        }
-    }
 
     frame.render_stateful_widget(list, area, &mut app.list_state);
 }
@@ -657,6 +670,8 @@ pub(super) fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         Line::from("  :help              show this help"),
         Line::from("  :warnings          list load warnings"),
         Line::from("  :lsp               list LSP languages"),
+        Line::from("  :collapse          collapse every node"),
+        Line::from("  :expand            expand every node"),
         Line::from("  o                  open selected in $EDITOR"),
         Line::from("  r                  reload symbols"),
         Line::from("  q  /  :q           quit"),

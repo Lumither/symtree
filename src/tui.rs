@@ -1,4 +1,5 @@
 use std::{
+    cell::{Ref, RefCell},
     collections::HashSet,
     env, mem,
     path::PathBuf,
@@ -18,12 +19,12 @@ use ratatui::{DefaultTerminal, widgets::ListState};
 
 use self::preview::{LOADING_INDICATOR_DELAY, PreviewCache, PreviewRequest, preview_worker};
 use self::render::render;
-use self::watcher::{SYMBOL_RELOAD_DEBOUNCE, fs_event_should_trigger_reload, reload_worker};
+use self::watcher::{SYMBOL_RELOAD_DEBOUNCE, fs_event_should_trigger_reload, loader_worker};
 
 use crate::{
     error::{AppContext, AppResult},
-    languages::{LanguageDef, lsp_program},
-    lsp::load_project_symbols,
+    languages::LanguageDef,
+    lsp::LoadEvent,
     model::ProjectSymbols,
     tree::{
         SelectionTarget, VisibleNode, flatten_visible, get_node, get_node_mut, selection_target,
@@ -34,6 +35,13 @@ use crate::{
 pub enum GlyphMode {
     Unicode,
     Ascii,
+}
+
+fn set_expanded_recursive(nodes: &mut [crate::model::SymbolNode], expanded: bool) {
+    for node in nodes {
+        node.expanded = expanded;
+        set_expanded_recursive(&mut node.children, expanded);
+    }
 }
 
 fn compose_load_message(prefix: &str, warnings: &[String]) -> String {
@@ -83,11 +91,15 @@ struct App {
     fs_event_rx: Receiver<notify::Result<notify::Event>>,
     _fs_watcher: Option<RecommendedWatcher>,
     symbols_dirty_at: Option<Instant>,
-    reload_request_tx: Sender<()>,
-    reload_result_rx: Receiver<AppResult<ProjectSymbols>>,
-    reload_in_flight: bool,
+    load_request_tx: Sender<()>,
+    load_event_rx: Receiver<LoadEvent>,
+    load_in_flight: bool,
+    loaded_file_count: usize,
+    discovered_file_count: usize,
     watched_files: HashSet<PathBuf>,
     center_selection_pending: bool,
+    visible_cache: RefCell<Option<Vec<VisibleNode>>>,
+    scroll_offset: usize,
 }
 
 impl App {
@@ -101,12 +113,12 @@ impl App {
         let (result_tx, result_rx) = mpsc::channel::<PreviewCache>();
         thread::spawn(move || preview_worker(request_rx, result_tx));
 
-        let (reload_request_tx, reload_request_rx) = mpsc::channel::<()>();
-        let (reload_result_tx, reload_result_rx) = mpsc::channel::<AppResult<ProjectSymbols>>();
+        let (load_request_tx, load_request_rx) = mpsc::channel::<()>();
+        let (load_event_tx, load_event_rx) = mpsc::channel::<LoadEvent>();
         {
             let root = root.clone();
             let langs = languages.clone();
-            thread::spawn(move || reload_worker(root, langs, reload_request_rx, reload_result_tx));
+            thread::spawn(move || loader_worker(root, langs, load_request_rx, load_event_tx));
         }
 
         let (fs_event_tx, fs_event_rx) = mpsc::channel::<notify::Result<notify::Event>>();
@@ -143,14 +155,22 @@ impl App {
             fs_event_rx,
             _fs_watcher: fs_watcher,
             symbols_dirty_at: None,
-            reload_request_tx,
-            reload_result_rx,
-            reload_in_flight: false,
+            load_request_tx,
+            load_event_rx,
+            load_in_flight: false,
+            loaded_file_count: 0,
+            discovered_file_count: 0,
             watched_files: HashSet::new(),
             center_selection_pending: false,
+            visible_cache: RefCell::new(None),
+            scroll_offset: 0,
         };
         app.refresh_watched_files();
-        if !app.project.warnings.is_empty() {
+        if app.project.files.is_empty() {
+            let _ = app.load_request_tx.send(());
+            app.load_in_flight = true;
+            app.message = "Indexing…".to_string();
+        } else if !app.project.warnings.is_empty() {
             app.set_load_message("Loaded");
         }
         app
@@ -158,6 +178,70 @@ impl App {
 
     fn set_load_message(&mut self, prefix: &str) {
         self.message = compose_load_message(prefix, &self.project.warnings);
+    }
+
+    fn request_reload(&mut self, status: &str) {
+        if self.load_in_flight {
+            return;
+        }
+        let _ = self.load_request_tx.send(());
+        self.load_in_flight = true;
+        self.message = status.to_string();
+    }
+
+    fn handle_load_event(&mut self, event: LoadEvent) {
+        match event {
+            LoadEvent::Started => {
+                let previous_path = self.selected_path();
+                self.project.files.clear();
+                self.project.warnings.clear();
+                self.invalidate_visible();
+                self.loaded_file_count = 0;
+                self.discovered_file_count = 0;
+                self.load_in_flight = true;
+                self.preview_cache = None;
+                self.preview_in_flight = None;
+                self.loading_overlay_shown = false;
+                if previous_path.is_some() {
+                    self.selected = 0;
+                }
+                self.update_indexing_message();
+            }
+            LoadEvent::Discovered(n) => {
+                self.discovered_file_count = self.discovered_file_count.saturating_add(n);
+                self.update_indexing_message();
+            }
+            LoadEvent::FileLoaded(file) => {
+                self.project.files.push(file);
+                self.invalidate_visible();
+                self.loaded_file_count += 1;
+                self.update_indexing_message();
+            }
+            LoadEvent::Warning(text) => {
+                self.project.warnings.push(text);
+            }
+            LoadEvent::Finished => {
+                self.project.files.sort_by(|a, b| a.name.cmp(&b.name));
+                self.invalidate_visible();
+                self.load_in_flight = false;
+                self.refresh_watched_files();
+                self.set_load_message(&format!("Loaded {} files", self.loaded_file_count));
+            }
+        }
+    }
+
+    fn update_indexing_message(&mut self) {
+        if !self.load_in_flight {
+            return;
+        }
+        self.message = if self.discovered_file_count > 0 {
+            format!(
+                "Indexing… {}/{} files",
+                self.loaded_file_count, self.discovered_file_count
+            )
+        } else {
+            format!("Indexing… {} files", self.loaded_file_count)
+        };
     }
 
     fn refresh_watched_files(&mut self) {
@@ -169,8 +253,18 @@ impl App {
             .collect();
     }
 
-    fn visible_nodes(&self) -> Vec<VisibleNode> {
-        flatten_visible(&self.project.files, &self.filter)
+    fn visible_nodes(&self) -> Ref<'_, Vec<VisibleNode>> {
+        if self.visible_cache.borrow().is_none() {
+            let computed = flatten_visible(&self.project.files, &self.filter);
+            *self.visible_cache.borrow_mut() = Some(computed);
+        }
+        Ref::map(self.visible_cache.borrow(), |opt| {
+            opt.as_ref().expect("filled above")
+        })
+    }
+
+    fn invalidate_visible(&self) {
+        *self.visible_cache.borrow_mut() = None;
     }
 
     fn clamp_selection(&mut self) {
@@ -241,6 +335,7 @@ impl App {
                     let previous_path = self.selected_path();
                     let previous_row = self.selected;
                     self.filter.clear();
+                    self.invalidate_visible();
                     self.restore_selection(previous_path.as_deref(), previous_row);
                     self.center_selection_pending = true;
                     self.message = "Filter cleared".to_string();
@@ -328,11 +423,13 @@ impl App {
             KeyCode::Backspace => {
                 self.filter.pop();
                 self.selected = 0;
+                self.invalidate_visible();
                 Action::None
             }
             KeyCode::Delete => {
                 self.filter.clear();
                 self.selected = 0;
+                self.invalidate_visible();
                 Action::None
             }
             KeyCode::Char(char) => {
@@ -341,6 +438,7 @@ impl App {
                 {
                     self.filter.push(char);
                     self.selected = 0;
+                    self.invalidate_visible();
                 }
                 Action::None
             }
@@ -406,6 +504,17 @@ impl App {
                 self.show_lsp = true;
                 self.message.clear();
             }
+            "collapse" => {
+                set_expanded_recursive(&mut self.project.files, false);
+                self.invalidate_visible();
+                self.selected = 0;
+                self.message = "Collapsed all".to_string();
+            }
+            "expand" => {
+                set_expanded_recursive(&mut self.project.files, true);
+                self.invalidate_visible();
+                self.message = "Expanded all".to_string();
+            }
             "q" | "quit" => {
                 self.should_quit = true;
             }
@@ -470,6 +579,7 @@ impl App {
             && node.has_children()
         {
             node.expanded = !node.expanded;
+            self.invalidate_visible();
         }
     }
 
@@ -482,12 +592,12 @@ impl App {
             return;
         }
 
-        let parent = &path[..path.len() - 1];
-        if let Some(index) = self
+        let parent = path[..path.len() - 1].to_vec();
+        let index = self
             .visible_nodes()
             .iter()
-            .position(|candidate| candidate.path == parent)
-        {
+            .position(|candidate| candidate.path == parent);
+        if let Some(index) = index {
             self.selected = index;
         }
     }
@@ -501,46 +611,55 @@ impl App {
             && node.has_children()
         {
             node.expanded = true;
+            self.invalidate_visible();
         }
 
-        let visible = self.visible_nodes();
-        let Some(current) = visible.get(self.selected) else {
-            return;
+        let index = {
+            let visible = self.visible_nodes();
+            let Some(current) = visible.get(self.selected) else {
+                return;
+            };
+            let child_depth = current.depth + 1;
+            visible
+                .iter()
+                .enumerate()
+                .skip(self.selected + 1)
+                .take_while(|(_, node)| node.depth > current.depth)
+                .find_map(|(index, node)| (node.depth == child_depth).then_some(index))
         };
-        let child_depth = current.depth + 1;
-        if let Some(index) = visible
-            .iter()
-            .enumerate()
-            .skip(self.selected + 1)
-            .take_while(|(_, node)| node.depth > current.depth)
-            .find_map(|(index, node)| (node.depth == child_depth).then_some(index))
-        {
+        if let Some(index) = index {
             self.selected = index;
         }
     }
 
     fn move_to_previous_sibling(&mut self) {
-        let visible = self.visible_nodes();
-        let Some(current) = visible.get(self.selected) else {
-            return;
+        let index = {
+            let visible = self.visible_nodes();
+            let Some(current) = visible.get(self.selected) else {
+                return;
+            };
+            let current_path = current.path.clone();
+            visible[..self.selected]
+                .iter()
+                .rposition(|node| has_same_parent(&node.path, &current_path))
         };
-        if let Some(index) = visible[..self.selected]
-            .iter()
-            .rposition(|node| has_same_parent(&node.path, &current.path))
-        {
+        if let Some(index) = index {
             self.selected = index;
         }
     }
 
     fn move_to_next_sibling(&mut self) {
-        let visible = self.visible_nodes();
-        let Some(current) = visible.get(self.selected) else {
-            return;
+        let offset = {
+            let visible = self.visible_nodes();
+            let Some(current) = visible.get(self.selected) else {
+                return;
+            };
+            let current_path = current.path.clone();
+            visible[self.selected + 1..]
+                .iter()
+                .position(|node| has_same_parent(&node.path, &current_path))
         };
-        if let Some(offset) = visible[self.selected + 1..]
-            .iter()
-            .position(|node| has_same_parent(&node.path, &current.path))
-        {
+        if let Some(offset) = offset {
             self.selected += offset + 1;
         }
     }
@@ -562,34 +681,46 @@ impl App {
     }
 
     fn restore_selection(&mut self, previous_path: Option<&[usize]>, previous_row: usize) {
-        let visible = self.visible_nodes();
-        if visible.is_empty() {
-            self.selected = 0;
-            self.list_state = ListState::default();
-            return;
+        enum Restored {
+            Empty,
+            Index(usize),
+            Fallback(usize),
         }
-
-        if let Some(path) = previous_path
-            && let Some(index) = visible.iter().position(|node| node.path.as_slice() == path)
-        {
-            self.selected = index;
-            return;
-        }
-
-        if let Some(path) = previous_path {
-            for len in (1..path.len()).rev() {
-                let ancestor = &path[..len];
-                if let Some(index) = visible
-                    .iter()
-                    .position(|node| node.path.as_slice() == ancestor)
-                {
-                    self.selected = index;
-                    return;
+        let action = {
+            let visible = self.visible_nodes();
+            if visible.is_empty() {
+                Restored::Empty
+            } else if let Some(path) = previous_path
+                && let Some(index) = visible.iter().position(|node| node.path.as_slice() == path)
+            {
+                Restored::Index(index)
+            } else if let Some(path) = previous_path {
+                let mut found = None;
+                for len in (1..path.len()).rev() {
+                    let ancestor = &path[..len];
+                    if let Some(index) = visible
+                        .iter()
+                        .position(|node| node.path.as_slice() == ancestor)
+                    {
+                        found = Some(index);
+                        break;
+                    }
                 }
+                match found {
+                    Some(i) => Restored::Index(i),
+                    None => Restored::Fallback(previous_row.min(visible.len() - 1)),
+                }
+            } else {
+                Restored::Fallback(previous_row.min(visible.len() - 1))
             }
+        };
+        match action {
+            Restored::Empty => {
+                self.selected = 0;
+                self.list_state = ListState::default();
+            }
+            Restored::Index(i) | Restored::Fallback(i) => self.selected = i,
         }
-
-        self.selected = previous_row.min(visible.len() - 1);
     }
 }
 
@@ -625,37 +756,19 @@ fn run_app(terminal: &mut DefaultTerminal, mut app: App) -> AppResult<()> {
 
         if let Some(t) = app.symbols_dirty_at
             && t.elapsed() >= SYMBOL_RELOAD_DEBOUNCE
-            && !app.reload_in_flight
+            && !app.load_in_flight
         {
             app.symbols_dirty_at = None;
-            app.reload_in_flight = true;
-            let _ = app.reload_request_tx.send(());
-            app.message = "Syncing symbols…".to_string();
+            app.request_reload("Syncing symbols…");
             needs_draw = true;
         }
 
-        let mut got_reload = false;
-        while let Ok(result) = app.reload_result_rx.try_recv() {
-            got_reload = true;
-            app.reload_in_flight = false;
-            let prev_path = app.selected_path();
-            let prev_row = app.selected;
-            match result {
-                Ok(project) => {
-                    app.project = project;
-                    app.refresh_watched_files();
-                    app.restore_selection(prev_path.as_deref(), prev_row);
-                    app.preview_cache = None;
-                    app.preview_in_flight = None;
-                    app.loading_overlay_shown = false;
-                    app.set_load_message("Symbols synced");
-                }
-                Err(err) => {
-                    app.message = format!("Sync failed: {err}");
-                }
-            }
+        let mut got_load_event = false;
+        while let Ok(event) = app.load_event_rx.try_recv() {
+            got_load_event = true;
+            app.handle_load_event(event);
         }
-        if got_reload {
+        if got_load_event {
             needs_draw = true;
         }
 
@@ -705,7 +818,7 @@ fn run_app(terminal: &mut DefaultTerminal, mut app: App) -> AppResult<()> {
                 match app.handle_key(key)? {
                     Action::None => {}
                     Action::Quit => app.should_quit = true,
-                    Action::Reload => reload_symbols(terminal, &mut app)?,
+                    Action::Reload => app.request_reload("Reloading…"),
                     Action::OpenSelection => open_selection(terminal, &mut app)?,
                 }
                 needs_draw = true;
@@ -714,35 +827,6 @@ fn run_app(terminal: &mut DefaultTerminal, mut app: App) -> AppResult<()> {
                 needs_draw = true;
             }
             _ => {}
-        }
-    }
-
-    Ok(())
-}
-
-fn reload_symbols(terminal: &mut DefaultTerminal, app: &mut App) -> AppResult<()> {
-    let previous_path = app.selected_path();
-    let previous_row = app.selected;
-    app.message = if app.languages.len() == 1 {
-        format!("Reloading through {}", lsp_program(&app.languages[0].lsp))
-    } else {
-        format!("Reloading {} languages…", app.languages.len())
-    };
-    terminal
-        .draw(|frame| render(frame, app))
-        .context("failed to render reload frame")?;
-
-    match load_project_symbols(&app.root, &app.languages) {
-        Ok(project) => {
-            app.project = project;
-            app.refresh_watched_files();
-            app.preview_cache = None;
-            app.preview_in_flight = None;
-            app.restore_selection(previous_path.as_deref(), previous_row);
-            app.set_load_message("Reloaded symbols");
-        }
-        Err(error) => {
-            app.message = format!("Reload failed: {error}");
         }
     }
 
@@ -811,7 +895,7 @@ fn next_poll_timeout(app: &App) -> Duration {
                 deadline.min((SYMBOL_RELOAD_DEBOUNCE - elapsed).max(Duration::from_millis(1)));
         }
     }
-    if app.reload_in_flight {
+    if app.load_in_flight {
         deadline = deadline.min(Duration::from_millis(30));
     }
     deadline
@@ -1063,47 +1147,55 @@ mod tests {
             ProjectSymbols {
                 root: PathBuf::from("/workspace"),
                 files: vec![
-                    SymbolNode::file(
-                        "src/lib.rs",
-                        vec![
-                            SymbolNode::new(
-                                "parent",
-                                SymbolKind::Lsp(2),
-                                Some(1),
-                                None,
-                                vec![
-                                    SymbolNode::new(
-                                        "child_a",
-                                        SymbolKind::Lsp(12),
-                                        Some(2),
-                                        None,
-                                        Vec::new(),
-                                    ),
-                                    SymbolNode::new(
-                                        "child_b",
-                                        SymbolKind::Lsp(12),
-                                        Some(3),
-                                        None,
-                                        Vec::new(),
-                                    ),
-                                ],
-                            ),
-                            SymbolNode::new(
-                                "other_parent",
-                                SymbolKind::Lsp(23),
-                                Some(5),
-                                None,
-                                vec![SymbolNode::new(
-                                    "other_child",
-                                    SymbolKind::Lsp(12),
-                                    Some(6),
+                    {
+                        let mut f = SymbolNode::file(
+                            "src/lib.rs",
+                            vec![
+                                SymbolNode::new(
+                                    "parent",
+                                    SymbolKind::Lsp(2),
+                                    Some(1),
                                     None,
-                                    Vec::new(),
-                                )],
-                            ),
-                        ],
-                    ),
-                    SymbolNode::file("src/main.rs", Vec::new()),
+                                    vec![
+                                        SymbolNode::new(
+                                            "child_a",
+                                            SymbolKind::Lsp(12),
+                                            Some(2),
+                                            None,
+                                            Vec::new(),
+                                        ),
+                                        SymbolNode::new(
+                                            "child_b",
+                                            SymbolKind::Lsp(12),
+                                            Some(3),
+                                            None,
+                                            Vec::new(),
+                                        ),
+                                    ],
+                                ),
+                                SymbolNode::new(
+                                    "other_parent",
+                                    SymbolKind::Lsp(23),
+                                    Some(5),
+                                    None,
+                                    vec![SymbolNode::new(
+                                        "other_child",
+                                        SymbolKind::Lsp(12),
+                                        Some(6),
+                                        None,
+                                        Vec::new(),
+                                    )],
+                                ),
+                            ],
+                        );
+                        f.expanded = true;
+                        f
+                    },
+                    {
+                        let mut f = SymbolNode::file("src/main.rs", Vec::new());
+                        f.expanded = true;
+                        f
+                    },
                 ],
                 warnings: Vec::new(),
             },
