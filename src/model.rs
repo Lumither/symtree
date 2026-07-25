@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone)]
 pub(crate) struct ProjectSymbols {
     pub root: PathBuf,
@@ -20,14 +22,24 @@ impl ProjectSymbols {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Serialized into the on-disk index; `expanded` is UI state, so it is skipped
+/// and restored to its default on load.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SymbolNode {
     pub name: String,
     pub kind: SymbolKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<SymbolNode>,
+    #[serde(skip, default = "expanded_default")]
     pub expanded: bool,
+}
+
+fn expanded_default() -> bool {
+    true
 }
 
 impl SymbolNode {
@@ -63,7 +75,7 @@ impl SymbolNode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum SymbolKind {
     File,
     Lsp(LspSymbolKind),
@@ -86,7 +98,7 @@ impl SymbolKind {
 /// arm for any value outside the spec. Modeling it as a closed enum keeps the
 /// label and color mappings exhaustive and compiler-checked instead of scattering
 /// magic numbers across modules.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub(crate) enum LspSymbolKind {
     File = 1,

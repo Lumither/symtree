@@ -28,6 +28,7 @@ use serde_json::{Value, json};
 
 use crate::{
     error::{AppContext, AppResult, app_error},
+    index,
     languages::{LanguageDef, lsp_program},
     model::{SymbolKind, SymbolNode},
     project::collect_source_files,
@@ -89,6 +90,27 @@ pub(crate) fn stream_language(root: &Path, lang: &LanguageDef, tx: Sender<LoadEv
     }
     let _ = tx.send(LoadEvent::Discovered(files.len()));
 
+    // Serve what the index knows; only spawn a server if something is stale.
+    // Signatures are taken before the read, so an edit during the load
+    // invalidates the shard we are about to write instead of being missed.
+    let mut stale = Vec::new();
+    for file in files {
+        let relative_name = relative_path(root, &file);
+        let signature = index::signature(&file);
+        match signature.and_then(|sig| index::get(root, &relative_name, sig)) {
+            Some(symbols) => {
+                let _ = tx.send(LoadEvent::FileLoaded(SymbolNode::file(
+                    relative_name,
+                    symbols,
+                )));
+            }
+            None => stale.push((file, relative_name, signature)),
+        }
+    }
+    if stale.is_empty() {
+        return;
+    }
+
     let root_uri = file_uri(root);
     let root_name = root
         .file_name()
@@ -114,8 +136,7 @@ pub(crate) fn stream_language(root: &Path, lang: &LanguageDef, tx: Sender<LoadEv
     let mut last_memory_rss: u64 = 0;
     let mut warned_absolute = false;
     let mut warned_rate = false;
-    for file in files {
-        let relative_name = relative_path(root, &file);
+    for (file, relative_name, signature) in stale {
         let text = match std::fs::read_to_string(&file) {
             Ok(text) => text,
             Err(error) => {
@@ -132,6 +153,11 @@ pub(crate) fn stream_language(root: &Path, lang: &LanguageDef, tx: Sender<LoadEv
 
         match client.document_symbols(&uri) {
             Ok(symbols) => {
+                if let Some(signature) = signature
+                    && let Err(error) = index::put(root, &relative_name, signature, &symbols)
+                {
+                    warn(&tx, format!("index: {error}"));
+                }
                 let _ = tx.send(LoadEvent::FileLoaded(SymbolNode::file(
                     relative_name,
                     symbols,

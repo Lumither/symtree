@@ -1,4 +1,5 @@
 mod error;
+mod index;
 mod languages;
 mod lsp;
 mod model;
@@ -29,6 +30,9 @@ fn run() -> AppResult<()> {
         .root
         .canonicalize()
         .with_context(|| format!("failed to resolve project root {}", args.root.display()))?;
+    if args.reindex {
+        let _ = std::fs::remove_dir_all(index::dir_for(&root));
+    }
     let empty = model::ProjectSymbols {
         root: root.clone(),
         files: Vec::new(),
@@ -41,6 +45,7 @@ fn run() -> AppResult<()> {
 struct Args {
     root: PathBuf,
     languages: Vec<LanguageDef>,
+    reindex: bool,
 }
 
 impl Args {
@@ -56,11 +61,13 @@ impl Args {
         let mut lang_names: Option<Vec<String>> = None;
         let mut override_lsp: Option<String> = None;
         let mut override_ext: Option<Vec<String>> = None;
+        let mut reindex = false;
         let mut args = args;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "-h" | "--help" => return Ok(None),
+                "--reindex" => reindex = true,
                 "--lang" => {
                     let value = args
                         .next()
@@ -96,6 +103,7 @@ impl Args {
         Ok(Some(Self {
             root: root.unwrap_or_else(|| PathBuf::from(".")),
             languages,
+            reindex,
         }))
     }
 }
@@ -157,7 +165,7 @@ fn resolve_languages(
 
 fn print_help() {
     println!(
-        "symtree - multi-language symbol tree TUI\n\nUsage:\n  symtree [PROJECT_PATH] [--lang LIST] [--lsp COMMAND] [--ext LIST]\n\nOptions:\n  --lang LIST    comma-separated language ids (e.g. rust,python)\n  --lsp COMMAND  override LSP command for the single language selected\n  --ext LIST     comma-separated file extensions (with --lsp for a custom language)\n  -h, --help     Show CLI help\n\nWith no flags, symtree probes every registered language found under PROJECT_PATH.\n\nEnvironment:\n  LSP_SEARCH_PATH  prepended to PATH when locating/spawning LSP binaries\n                   (e.g. ~/.local/share/nvim/mason/bin)\n\nInside the TUI:\n  :help          show keymap\n  :q             quit"
+        "symtree - multi-language symbol tree TUI\n\nUsage:\n  symtree [PROJECT_PATH] [--lang LIST] [--lsp COMMAND] [--ext LIST]\n\nOptions:\n  --lang LIST    comma-separated language ids (e.g. rust,python)\n  --lsp COMMAND  override LSP command for the single language selected\n  --ext LIST     comma-separated file extensions (with --lsp for a custom language)\n  --reindex      discard the cached symbol index for this project first\n  -h, --help     Show CLI help\n\nWith no flags, symtree probes every registered language found under PROJECT_PATH.\n\nSymbols are cached per file under $XDG_CACHE_HOME/symtree/ and reused while the\nfile's mtime and size are unchanged, so only edited files are re-queried.\n\nEnvironment:\n  LSP_SEARCH_PATH  prepended to PATH when locating/spawning LSP binaries\n                   (e.g. ~/.local/share/nvim/mason/bin)\n\nInside the TUI:\n  :help          show keymap\n  :q             quit"
     );
 }
 
