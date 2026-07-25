@@ -11,6 +11,7 @@
   "cpp":        { "lsp": "clangd",                                 "language_id": "cpp",        "extensions": ["cpp", "cc", "cxx", "hpp", "hh", "hxx"] },
   "bash":       { "lsp": "bash-language-server start",             "language_id": "shellscript","extensions": ["sh", "bash"] },
   "haskell":    { "lsp": "haskell-language-server-wrapper --lsp",  "language_id": "haskell",    "extensions": ["hs", "lhs"] },
+  "erlang":     { "lsp": "elp server",                             "language_id": "erlang",     "extensions": ["erl", "hrl"] },
   "ruby":       { "lsp": "solargraph stdio",                       "language_id": "ruby",       "extensions": ["rb"] },
   "java":       { "lsp": "jdtls",                                  "language_id": "java",       "extensions": ["java"] },
   "kotlin":     { "lsp": "kotlin-language-server",                 "language_id": "kotlin",     "extensions": ["kt", "kts"] },

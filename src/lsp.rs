@@ -1,4 +1,6 @@
 use std::{
+    error::Error,
+    fmt,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
@@ -8,6 +10,11 @@ use std::{
 };
 
 const DOCUMENT_SYMBOLS_TIMEOUT: Duration = Duration::from_secs(15);
+/// Upper bound on how long we retry `documentSymbol` while a server reports it is
+/// still indexing the workspace (elp, rust-analyzer). Without this the first load
+/// would be dropped entirely.
+const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(120);
+const SERVER_READY_POLL_INTERVAL: Duration = Duration::from_millis(300);
 /// How long to wait for a reply to the `shutdown` request before giving up and
 /// forcing the process down. Bounded so a server that never answers can't hang us.
 const SHUTDOWN_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -25,6 +32,33 @@ use crate::{
     model::{SymbolKind, SymbolNode},
     project::collect_source_files,
 };
+
+/// An LSP `error` response plus whether it is worth retrying — set when the
+/// server is merely not ready yet rather than refusing the request outright.
+#[derive(Debug)]
+struct LspError {
+    message: String,
+    retryable: bool,
+}
+
+impl fmt::Display for LspError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Error for LspError {}
+
+fn error_is_retryable(code: Option<i64>, message: &str) -> bool {
+    // -32801 ContentModified, -32802 ServerCancelled, -32803 RequestFailed,
+    // -32002 ServerNotInitialized — all "try again once I'm settled" signals.
+    matches!(code, Some(-32801 | -32802 | -32803 | -32002)) || {
+        let lower = message.to_lowercase();
+        ["loading", "indexing", "not ready", "initializing"]
+            .iter()
+            .any(|needle| lower.contains(needle))
+    }
+}
 
 pub(crate) enum LoadEvent {
     Started,
@@ -317,17 +351,34 @@ impl LspClient {
     }
 
     fn document_symbols(&mut self, uri: &str) -> AppResult<Vec<SymbolNode>> {
-        let result = self.request_with_timeout(
-            "textDocument/documentSymbol",
-            json!({
-                "textDocument": {
-                    "uri": uri
+        // Poll past the "still loading" error a freshly-started server returns
+        // while indexing. The load loop is sequential, so the first file absorbs
+        // the wait and the rest succeed immediately.
+        let deadline = Instant::now() + SERVER_READY_TIMEOUT;
+        loop {
+            let outcome = self.request_with_timeout(
+                "textDocument/documentSymbol",
+                json!({
+                    "textDocument": {
+                        "uri": uri
+                    }
+                }),
+                DOCUMENT_SYMBOLS_TIMEOUT,
+            );
+            match outcome {
+                Ok(result) => return Ok(parse_symbols(&result)),
+                Err(error) => {
+                    let retryable = error
+                        .downcast_ref::<LspError>()
+                        .is_some_and(|e| e.retryable);
+                    if retryable && Instant::now() < deadline {
+                        thread::sleep(SERVER_READY_POLL_INTERVAL);
+                        continue;
+                    }
+                    return Err(error);
                 }
-            }),
-            DOCUMENT_SYMBOLS_TIMEOUT,
-        )?;
-
-        Ok(parse_symbols(&result))
+            }
+        }
     }
 
     fn request(&mut self, method: &str, params: Value) -> AppResult<Value> {
@@ -365,13 +416,15 @@ impl LspClient {
 
             if is_response_for(&message, id) {
                 if let Some(error) = message.get("error") {
-                    return Err(app_error(format!(
-                        "LSP request `{method}` failed: {}",
-                        error
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown error")
-                    )));
+                    let code = error.get("code").and_then(Value::as_i64);
+                    let detail = error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown error");
+                    return Err(Box::new(LspError {
+                        message: format!("LSP request `{method}` failed: {detail}"),
+                        retryable: error_is_retryable(code, detail),
+                    }));
                 }
 
                 return Ok(message.get("result").cloned().unwrap_or(Value::Null));

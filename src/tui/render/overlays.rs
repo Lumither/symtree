@@ -145,7 +145,16 @@ pub(super) fn render_lsp(frame: &mut Frame, app: &App, area: Rect) {
     )));
     lines.push(Line::raw(""));
 
-    let mut entries: Vec<(u8, &str, Color, &crate::languages::LanguageDef, usize)> = app
+    struct LspEntry<'a> {
+        rank: u8,
+        status: &'static str,
+        color: Color,
+        program: &'a str,
+        extensions: &'a [String],
+        files_seen: usize,
+    }
+
+    let mut entries: Vec<LspEntry> = app
         .languages
         .iter()
         .map(|lang| {
@@ -161,36 +170,51 @@ pub(super) fn render_lsp(frame: &mut Frame, app: &App, area: Rect) {
                         .is_some_and(|e| lang.extensions.iter().any(|x| x == e))
                 })
                 .count();
-            let (rank, label, color) = if installed && files_seen > 0 {
-                (0u8, "active", Color::Green)
-            } else if installed {
-                (1u8, "idle", Color::DarkGray)
-            } else {
-                (2u8, "missing", Color::DarkGray)
+            // missing (files but no server) is the only real gap; inactive just
+            // means the language isn't present in this project.
+            let (rank, status, color) = match (installed, files_seen > 0) {
+                (true, true) => (0u8, "active", Color::Green),
+                (true, false) => (1u8, "idle", Color::Cyan),
+                (false, true) => (2u8, "missing", Color::Red),
+                (false, false) => (3u8, "inactive", Color::DarkGray),
             };
-            (rank, label, color, lang, files_seen)
+            LspEntry {
+                rank,
+                status,
+                color,
+                program: crate::languages::lsp_program(&lang.lsp),
+                extensions: &lang.extensions,
+                files_seen,
+            }
         })
         .collect();
-    entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.3.lsp.cmp(&b.3.lsp)));
+    entries.sort_by(|a, b| a.rank.cmp(&b.rank).then_with(|| a.program.cmp(b.program)));
 
-    for (_, status_text, status_color, lang, files_seen) in entries {
-        let program = crate::languages::lsp_program(&lang.lsp);
+    // Pad the program column to the widest name so the files/status columns line
+    // up vertically regardless of how long any one server command is.
+    let program_width = entries
+        .iter()
+        .map(|e| e.program.chars().count())
+        .max()
+        .unwrap_or(0);
+
+    for entry in entries {
         lines.push(Line::from(vec![
             Span::styled(
-                format!("  {:<14}", program),
-                Style::default().fg(Color::White),
+                format!("  {:<program_width$}  ", entry.program),
+                Style::default().fg(entry.color),
             ),
             Span::styled(
-                format!("{:>4} files  ", files_seen),
+                format!("{:>4} files  ", entry.files_seen),
                 Style::default().fg(Color::Gray),
             ),
             Span::styled(
-                format!("[{status_text}]"),
-                Style::default().fg(status_color).bold(),
+                format!("[{}]", entry.status),
+                Style::default().fg(entry.color).bold(),
             ),
         ]));
         lines.push(Line::from(Span::styled(
-            format!("    ext: {}", lang.extensions.join(", ")),
+            format!("    ext: {}", entry.extensions.join(", ")),
             Style::default().fg(Color::DarkGray),
         )));
     }
