@@ -34,29 +34,33 @@ fn run() -> AppResult<()> {
         files: Vec::new(),
         warnings: Vec::new(),
     };
-    tui::run(root, args.languages, args.glyph_mode, empty)
+    tui::run(root, args.languages, empty)
 }
 
 #[derive(Debug)]
 struct Args {
     root: PathBuf,
     languages: Vec<LanguageDef>,
-    glyph_mode: tui::GlyphMode,
 }
 
 impl Args {
     fn parse() -> AppResult<Option<Self>> {
+        Self::parse_from(env::args().skip(1))
+    }
+
+    /// Parse from an explicit argument iterator (the program name already
+    /// stripped). Separated from `parse` so the flag handling can be tested
+    /// without faking `env::args()`.
+    fn parse_from<I: Iterator<Item = String>>(args: I) -> AppResult<Option<Self>> {
         let mut root: Option<PathBuf> = None;
         let mut lang_names: Option<Vec<String>> = None;
         let mut override_lsp: Option<String> = None;
         let mut override_ext: Option<Vec<String>> = None;
-        let mut glyph_mode = tui::GlyphMode::Unicode;
-        let mut args = env::args().skip(1);
+        let mut args = args;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "-h" | "--help" => return Ok(None),
-                "--ascii" => glyph_mode = tui::GlyphMode::Ascii,
                 "--lang" => {
                     let value = args
                         .next()
@@ -92,7 +96,6 @@ impl Args {
         Ok(Some(Self {
             root: root.unwrap_or_else(|| PathBuf::from(".")),
             languages,
-            glyph_mode,
         }))
     }
 }
@@ -154,6 +157,92 @@ fn resolve_languages(
 
 fn print_help() {
     println!(
-        "symtree - multi-language symbol tree TUI\n\nUsage:\n  symtree [PROJECT_PATH] [--lang LIST] [--lsp COMMAND] [--ext LIST] [--ascii]\n\nOptions:\n  --lang LIST    comma-separated language ids (e.g. rust,python)\n  --lsp COMMAND  override LSP command for the single language selected\n  --ext LIST     comma-separated file extensions (with --lsp for a custom language)\n  --ascii        Use ASCII tree markers instead of Unicode\n  -h, --help     Show CLI help\n\nWith no flags, symtree probes every registered language found under PROJECT_PATH.\n\nEnvironment:\n  LSP_SEARCH_PATH  prepended to PATH when locating/spawning LSP binaries\n                   (e.g. ~/.local/share/nvim/mason/bin)\n\nInside the TUI:\n  :help          show keymap\n  :q             quit"
+        "symtree - multi-language symbol tree TUI\n\nUsage:\n  symtree [PROJECT_PATH] [--lang LIST] [--lsp COMMAND] [--ext LIST]\n\nOptions:\n  --lang LIST    comma-separated language ids (e.g. rust,python)\n  --lsp COMMAND  override LSP command for the single language selected\n  --ext LIST     comma-separated file extensions (with --lsp for a custom language)\n  -h, --help     Show CLI help\n\nWith no flags, symtree probes every registered language found under PROJECT_PATH.\n\nEnvironment:\n  LSP_SEARCH_PATH  prepended to PATH when locating/spawning LSP binaries\n                   (e.g. ~/.local/share/nvim/mason/bin)\n\nInside the TUI:\n  :help          show keymap\n  :q             quit"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> AppResult<Option<Args>> {
+        Args::parse_from(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn no_args_defaults_to_cwd_and_all_languages() {
+        let parsed = parse(&[]).unwrap().expect("not help");
+        assert_eq!(parsed.root, PathBuf::from("."));
+        assert_eq!(parsed.languages.len(), languages::all().len());
+    }
+
+    #[test]
+    fn positional_path_is_used_as_root() {
+        let parsed = parse(&["/some/proj"]).unwrap().expect("not help");
+        assert_eq!(parsed.root, PathBuf::from("/some/proj"));
+    }
+
+    #[test]
+    fn help_flag_returns_none() {
+        assert!(parse(&["--help"]).unwrap().is_none());
+        assert!(parse(&["-h"]).unwrap().is_none());
+    }
+
+    #[test]
+    fn unknown_flag_and_duplicate_path_error() {
+        assert!(parse(&["--nope"]).is_err());
+        assert!(parse(&["a", "b"]).is_err());
+        assert!(parse(&["--lang"]).is_err()); // missing value
+    }
+
+    #[test]
+    fn lang_selects_named_languages() {
+        let parsed = parse(&["--lang", "rust"]).unwrap().expect("not help");
+        assert_eq!(parsed.languages.len(), 1);
+        assert_eq!(parsed.languages[0].lsp, "rust-analyzer");
+    }
+
+    // resolve_languages precedence table.
+
+    #[test]
+    fn lsp_and_ext_make_a_custom_language() {
+        let langs =
+            resolve_languages(None, Some("my-ls".into()), Some(vec!["foo".into()])).unwrap();
+        assert_eq!(langs.len(), 1);
+        assert_eq!(langs[0].lsp, "my-ls");
+        assert_eq!(langs[0].extensions, vec!["foo".to_string()]);
+    }
+
+    #[test]
+    fn lang_plus_lsp_overrides_the_single_language_command() {
+        let langs =
+            resolve_languages(Some(vec!["rust".into()]), Some("my-ra".into()), None).unwrap();
+        assert_eq!(langs.len(), 1);
+        assert_eq!(langs[0].lsp, "my-ra");
+        assert_eq!(langs[0].extensions, vec!["rs".to_string()]);
+    }
+
+    #[test]
+    fn lsp_alone_infers_extensions_from_registry() {
+        let langs = resolve_languages(None, Some("rust-analyzer".into()), None).unwrap();
+        assert_eq!(langs.len(), 1);
+        assert_eq!(langs[0].extensions, vec!["rs".to_string()]);
+    }
+
+    #[test]
+    fn lsp_alone_unknown_program_errors() {
+        assert!(resolve_languages(None, Some("totally-unknown-ls".into()), None).is_err());
+    }
+
+    #[test]
+    fn empty_and_unknown_lang_lists_error() {
+        assert!(resolve_languages(Some(vec![]), None, None).is_err());
+        assert!(resolve_languages(Some(vec!["klingon".into()]), None, None).is_err());
+    }
+
+    #[test]
+    fn no_overrides_returns_every_language() {
+        let langs = resolve_languages(None, None, None).unwrap();
+        assert_eq!(langs.len(), languages::all().len());
+    }
 }

@@ -30,6 +30,11 @@ static THEME: LazyLock<Theme> = LazyLock::new(|| {
 
 pub(super) const LOADING_INDICATOR_DELAY: Duration = Duration::from_millis(100);
 
+/// Files larger than this are not previewed. Reading and highlighting a
+/// multi-megabyte (or multi-gigabyte) file would block the worker and balloon
+/// memory; source files we care about are comfortably under this.
+const MAX_PREVIEW_BYTES: u64 = 4 * 1024 * 1024;
+
 pub(super) struct PreviewCache {
     pub(super) path: PathBuf,
     pub(super) window_start: usize,
@@ -58,6 +63,21 @@ pub(super) fn preview_worker(rx: Receiver<PreviewRequest>, tx: Sender<PreviewCac
 
 fn compute_preview(req: &PreviewRequest) -> PreviewCache {
     let path = req.path.clone();
+
+    if let Ok(metadata) = fs::metadata(&path)
+        && metadata.len() > MAX_PREVIEW_BYTES
+    {
+        return PreviewCache {
+            path,
+            window_start: 0,
+            total_lines: 0,
+            highlighted: None,
+            error: Some(format!(
+                "file too large to preview ({:.1} MiB)",
+                metadata.len() as f64 / (1024.0 * 1024.0)
+            )),
+        };
+    }
 
     let source = match fs::read_to_string(&path) {
         Ok(text) => text,
@@ -100,6 +120,14 @@ fn compute_preview(req: &PreviewRequest) -> PreviewCache {
 
     let syntax = detect_syntax(&path, &source);
     let mut highlighter = HighlightLines::new(syntax, &THEME);
+    // Syntect's highlighter is stateful: the color of a line can depend on
+    // earlier ones (open block comments, multi-line strings, here-docs). Feed it
+    // the lines preceding the window, discarding their output, so the window is
+    // colored with the correct carried-over state rather than as if the file
+    // began at `start`.
+    for line in &lines[..start] {
+        let _ = highlighter.highlight_line(line, &SYNTAX_SET);
+    }
     let highlighted: Vec<Vec<(SyntectStyle, String)>> = lines[start..end]
         .iter()
         .map(|line| match highlighter.highlight_line(line, &SYNTAX_SET) {
@@ -164,7 +192,7 @@ pub(super) fn build_preview_lines(
     let (start, end) = viewport_range(target_line, inner_height, total);
 
     let gutter_width = format!("{}", total.max(1)).chars().count().max(3);
-    let highlight_bg = Color::Indexed(238);
+    let highlight_bg = super::theme::SELECTION_BG;
     let window_start = cache.window_start;
     let window_end = window_start + highlighted.len();
     let tilde_style = Style::default().fg(Color::DarkGray);
@@ -206,7 +234,10 @@ pub(super) fn build_preview_lines(
         }
 
         if is_target {
-            let consumed: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+            let consumed: usize = spans
+                .iter()
+                .map(|s| super::render::display_width(&s.content))
+                .sum();
             if consumed < inner_width {
                 spans.push(Span::styled(
                     " ".repeat(inner_width - consumed),
@@ -228,4 +259,75 @@ pub(super) fn build_preview_lines(
 
 fn syntect_color_to_ratatui(color: syntect::highlighting::Color) -> Color {
     Color::Rgb(color.r, color.g, color.b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn owned_chunks(chunks: Vec<(SyntectStyle, &str)>) -> Vec<(SyntectStyle, String)> {
+        chunks
+            .into_iter()
+            .map(|(style, text)| (style, text.to_string()))
+            .collect()
+    }
+
+    // A window that opens inside a multi-line block comment must be colored as a
+    // comment, i.e. identically to highlighting the whole file up to that line —
+    // not as if the file began at the window start.
+    #[test]
+    fn preview_window_inside_block_comment_uses_carried_over_state() {
+        // Lines 0..150 sit inside an open block comment; 150.. is real code.
+        let mut source = String::from("/* opening of a long block comment\n");
+        for i in 1..150 {
+            source.push_str(&format!("comment body line {i}\n"));
+        }
+        source.push_str("*/\n");
+        for i in 0..50 {
+            source.push_str(&format!("fn f{i}() {{}}\n"));
+        }
+
+        let path =
+            std::env::temp_dir().join(format!("symtree_preview_ctx_{}.rs", std::process::id()));
+        std::fs::write(&path, &source).expect("write temp source");
+
+        let cache = compute_preview(&PreviewRequest {
+            path: path.clone(),
+            target_line: 130,
+            window: 10,
+        });
+        std::fs::remove_file(&path).ok();
+
+        let start = cache.window_start;
+        assert!(
+            start > 0,
+            "test needs a window that does not start at line 0"
+        );
+        assert!(start < 150, "window must start inside the block comment");
+
+        let highlighted = cache.highlighted.expect("highlighted lines");
+
+        // Truth: highlight the whole file with full carried-over state.
+        let syntax = SYNTAX_SET.find_syntax_by_extension("rs").unwrap();
+        let lines: Vec<&str> = source.lines().collect();
+        let mut full = HighlightLines::new(syntax, &THEME);
+        let expected: Vec<Vec<(SyntectStyle, String)>> = lines
+            .iter()
+            .map(|line| owned_chunks(full.highlight_line(line, &SYNTAX_SET).unwrap()))
+            .collect();
+
+        assert_eq!(
+            highlighted[0], expected[start],
+            "first windowed line should match full-context highlighting"
+        );
+
+        // And it must differ from the buggy un-primed coloring (the line treated
+        // as if it were the first line of the file), otherwise the test is vacuous.
+        let mut naive = HighlightLines::new(syntax, &THEME);
+        let naive_first = owned_chunks(naive.highlight_line(lines[start], &SYNTAX_SET).unwrap());
+        assert_ne!(
+            highlighted[0], naive_first,
+            "priming should change the coloring of a line inside a block comment"
+        );
+    }
 }

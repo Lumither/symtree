@@ -1,11 +1,12 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::languages;
-use crate::model::SymbolNode;
+use crate::model::{SymbolKind, SymbolNode};
 use crate::query::{Expr, MatchCtx};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VisibleNode {
+pub(crate) struct VisibleNode {
     pub path: Vec<usize>,
     pub depth: usize,
     pub is_last: bool,
@@ -14,13 +15,13 @@ pub struct VisibleNode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SelectionTarget {
+pub(crate) struct SelectionTarget {
     pub file: PathBuf,
     pub line: usize,
     pub label: String,
 }
 
-pub fn flatten_visible(nodes: &[SymbolNode], query: Option<&Expr>) -> Vec<VisibleNode> {
+pub(crate) fn flatten_visible(nodes: &[SymbolNode], query: Option<&Expr>) -> Vec<VisibleNode> {
     let mut visible = Vec::new();
     let mut path = Vec::new();
     let mut ancestor_is_last = Vec::new();
@@ -35,7 +36,7 @@ pub fn flatten_visible(nodes: &[SymbolNode], query: Option<&Expr>) -> Vec<Visibl
     visible
 }
 
-pub fn get_node<'a>(nodes: &'a [SymbolNode], path: &[usize]) -> Option<&'a SymbolNode> {
+pub(crate) fn get_node<'a>(nodes: &'a [SymbolNode], path: &[usize]) -> Option<&'a SymbolNode> {
     let (first, rest) = path.split_first()?;
     let node = nodes.get(*first)?;
     if rest.is_empty() {
@@ -45,7 +46,10 @@ pub fn get_node<'a>(nodes: &'a [SymbolNode], path: &[usize]) -> Option<&'a Symbo
     }
 }
 
-pub fn get_node_mut<'a>(nodes: &'a mut [SymbolNode], path: &[usize]) -> Option<&'a mut SymbolNode> {
+pub(crate) fn get_node_mut<'a>(
+    nodes: &'a mut [SymbolNode],
+    path: &[usize],
+) -> Option<&'a mut SymbolNode> {
     let (first, rest) = path.split_first()?;
     let node = nodes.get_mut(*first)?;
     if rest.is_empty() {
@@ -55,7 +59,7 @@ pub fn get_node_mut<'a>(nodes: &'a mut [SymbolNode], path: &[usize]) -> Option<&
     }
 }
 
-pub fn selection_target(
+pub(crate) fn selection_target(
     root: &Path,
     nodes: &[SymbolNode],
     path: &[usize],
@@ -69,6 +73,87 @@ pub fn selection_target(
         line,
         label: selected_node.name.clone(),
     })
+}
+
+/// Expand or collapse every node in the forest.
+pub(crate) fn set_expanded_recursive(nodes: &mut [SymbolNode], expanded: bool) {
+    for node in nodes {
+        node.expanded = expanded;
+        set_expanded_recursive(&mut node.children, expanded);
+    }
+}
+
+/// Whether a node is expanded by default (everything except top-level files).
+fn default_expanded(node: &SymbolNode) -> bool {
+    !matches!(node.kind, SymbolKind::File)
+}
+
+/// Capture, keyed by name-path, every node whose expansion differs from its
+/// default — i.e. the user's manual expand/collapse choices, so they can be
+/// reapplied across a reload.
+pub(crate) fn collect_expanded_overrides(nodes: &[SymbolNode]) -> HashMap<Vec<String>, bool> {
+    fn walk(nodes: &[SymbolNode], path: &mut Vec<String>, out: &mut HashMap<Vec<String>, bool>) {
+        for node in nodes {
+            path.push(node.name.clone());
+            if node.expanded != default_expanded(node) {
+                out.insert(path.clone(), node.expanded);
+            }
+            walk(&node.children, path, out);
+            path.pop();
+        }
+    }
+    let mut out = HashMap::new();
+    let mut path = Vec::new();
+    walk(nodes, &mut path, &mut out);
+    out
+}
+
+/// Reapply expansion overrides (from [`collect_expanded_overrides`]) onto a file
+/// subtree after it is reloaded.
+pub(crate) fn apply_expanded_overrides(
+    node: &mut SymbolNode,
+    overrides: &HashMap<Vec<String>, bool>,
+) {
+    fn walk(node: &mut SymbolNode, path: &mut Vec<String>, overrides: &HashMap<Vec<String>, bool>) {
+        path.push(node.name.clone());
+        if let Some(&expanded) = overrides.get(path) {
+            node.expanded = expanded;
+        }
+        for child in &mut node.children {
+            walk(child, path, overrides);
+        }
+        path.pop();
+    }
+    let mut path = Vec::new();
+    walk(node, &mut path, overrides);
+}
+
+/// Translate an index-path into the corresponding name-path.
+pub(crate) fn name_path_for(nodes: &[SymbolNode], index_path: &[usize]) -> Option<Vec<String>> {
+    let mut out = Vec::with_capacity(index_path.len());
+    let mut current = nodes;
+    for &idx in index_path {
+        let node = current.get(idx)?;
+        out.push(node.name.clone());
+        current = &node.children;
+    }
+    Some(out)
+}
+
+/// Translate a name-path back into an index-path, resolving each segment to the
+/// first sibling with a matching name.
+pub(crate) fn name_path_to_index_path(
+    nodes: &[SymbolNode],
+    name_path: &[String],
+) -> Option<Vec<usize>> {
+    let mut out = Vec::with_capacity(name_path.len());
+    let mut current = nodes;
+    for name in name_path {
+        let i = current.iter().position(|n| &n.name == name)?;
+        out.push(i);
+        current = &current[i].children;
+    }
+    Some(out)
 }
 
 fn append_visible_nodes(
@@ -155,12 +240,12 @@ mod tests {
             "src/main.rs",
             vec![SymbolNode::new(
                 "outer",
-                SymbolKind::Lsp(12),
+                SymbolKind::from_lsp(12),
                 Some(3),
                 None,
                 vec![SymbolNode::new(
                     "inner",
-                    SymbolKind::Lsp(12),
+                    SymbolKind::from_lsp(12),
                     Some(4),
                     None,
                     Vec::new(),
@@ -183,12 +268,12 @@ mod tests {
             "src/lib.rs",
             vec![SymbolNode::new(
                 "parent",
-                SymbolKind::Lsp(2),
+                SymbolKind::from_lsp(2),
                 Some(1),
                 None,
                 vec![SymbolNode::new(
                     "needle",
-                    SymbolKind::Lsp(12),
+                    SymbolKind::from_lsp(12),
                     Some(9),
                     None,
                     Vec::new(),
@@ -218,7 +303,7 @@ mod tests {
             "src/lib.rs",
             vec![SymbolNode::new(
                 "Thing",
-                SymbolKind::Lsp(23),
+                SymbolKind::from_lsp(23),
                 Some(42),
                 None,
                 Vec::new(),

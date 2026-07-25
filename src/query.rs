@@ -15,6 +15,16 @@ pub(crate) enum Expr {
     },
 }
 
+/// Combine two optional queries with logical AND, treating `None` as "no
+/// constraint". Used to fuse the persistent `:query` with the live `/filter`.
+pub(crate) fn combine(a: Option<Expr>, b: Option<Expr>) -> Option<Expr> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(Expr::And(vec![a, b])),
+        (Some(expr), None) | (None, Some(expr)) => Some(expr),
+        (None, None) => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PredicateKey {
     Lang,

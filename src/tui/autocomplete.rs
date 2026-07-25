@@ -1,10 +1,6 @@
 use super::App;
 
 const PREDICATE_KEYS: &[&str] = &["lang:", "kind:", "file:", "name:"];
-const KNOWN_KINDS: &[&str] = &[
-    "fn", "method", "struct", "enum", "trait", "impl", "obj", "field", "mod", "const", "var",
-    "array", "str", "bool", "file",
-];
 const COMMANDS: &[&str] = &[
     "help",
     "keymap",
@@ -102,13 +98,12 @@ fn query_candidates(input: &str, app: &App) -> Vec<String> {
 fn value_candidates(key: &str, partial: &str, app: &App) -> Vec<String> {
     let partial_lower = partial.to_lowercase();
     match key {
-        "lang" => crate::languages::REGISTRY
-            .keys()
+        "lang" => crate::languages::names()
             .filter(|k| k.to_lowercase().starts_with(&partial_lower))
             .map(|k| format!("lang:{k}"))
             .collect(),
-        "kind" => KNOWN_KINDS
-            .iter()
+        "kind" => crate::model::kind_labels()
+            .into_iter()
             .filter(|k| k.starts_with(&partial_lower))
             .map(|k| format!("kind:{k}"))
             .collect(),

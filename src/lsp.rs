@@ -8,6 +8,11 @@ use std::{
 };
 
 const DOCUMENT_SYMBOLS_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long to wait for a reply to the `shutdown` request before giving up and
+/// forcing the process down. Bounded so a server that never answers can't hang us.
+const SHUTDOWN_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long to wait for the process to exit on its own after `exit` before we kill it.
+const EXIT_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const MEMORY_CHECK_INTERVAL: Duration = Duration::from_secs(3);
 const MEMORY_ABSOLUTE_THRESHOLD: u64 = 5 * 1024 * 1024 * 1024;
 const MEMORY_RATE_THRESHOLD: u64 = 500 * 1024 * 1024;
@@ -21,15 +26,18 @@ use crate::{
     project::collect_source_files,
 };
 
-pub enum LoadEvent {
+pub(crate) enum LoadEvent {
     Started,
     Discovered(usize),
     FileLoaded(SymbolNode),
+    /// The non-fatal arm of the error taxonomy: a per-file or per-language
+    /// failure the load survives (a server that wouldn't start, a file that
+    /// couldn't be read). Fatal failures instead short-circuit via `AppResult`.
     Warning(String),
     Finished,
 }
 
-pub fn stream_language(root: &Path, lang: &LanguageDef, tx: Sender<LoadEvent>) {
+pub(crate) fn stream_language(root: &Path, lang: &LanguageDef, tx: Sender<LoadEvent>) {
     let warn = |tx: &Sender<LoadEvent>, msg: String| {
         let _ = tx.send(LoadEvent::Warning(msg));
     };
@@ -185,7 +193,7 @@ fn direct_children_pids(parent: u32) -> Vec<u32> {
     }
 }
 
-pub fn lsp_is_available(command: &str) -> bool {
+pub(crate) fn lsp_is_available(command: &str) -> bool {
     let program = command.split_whitespace().next().unwrap_or(command);
     if program.contains(std::path::MAIN_SEPARATOR) {
         return Path::new(program).is_file();
@@ -457,14 +465,48 @@ impl LspClient {
     }
 
     fn shutdown(&mut self) {
-        let _ = self.request("shutdown", Value::Null);
+        // Bound the handshake: a misbehaving server that never replies to
+        // `shutdown` or never honors `exit` must not be able to hang us. Both the
+        // request and the wait are time-boxed, and `wait_or_kill` guarantees we
+        // reach a `kill` — which closes the server's stdout and in turn unblocks
+        // the reader thread if it is stuck mid-body in `read_exact`.
+        let _ = self.request_with_timeout("shutdown", Value::Null, SHUTDOWN_REQUEST_TIMEOUT);
         let _ = self.notify("exit", Value::Null);
-        let _ = self.child.wait();
+        wait_or_kill(&mut self.child, EXIT_WAIT_TIMEOUT);
+    }
+}
+
+/// Wait up to `timeout` for the child to exit on its own; if it doesn't, kill it
+/// and reap it. Never blocks longer than `timeout` plus the time for SIGKILL to
+/// take effect. Killing the child closes its pipes, which releases the reader
+/// thread if it is blocked on the process's stdout.
+fn wait_or_kill(child: &mut Child, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+        }
     }
 }
 
 impl Drop for LspClient {
     fn drop(&mut self) {
+        // Backstop for paths that don't call `shutdown` (e.g. an initialize
+        // failure). SIGKILL can't be ignored, so the following wait returns
+        // promptly; if `shutdown` already reaped the child these are no-ops.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -501,7 +543,7 @@ fn parse_document_symbol(value: &Value) -> Option<SymbolNode> {
         .get("kind")
         .and_then(Value::as_u64)
         .map(SymbolKind::from_lsp)
-        .unwrap_or(SymbolKind::Lsp(0));
+        .unwrap_or(SymbolKind::from_lsp(0));
     let line = value
         .pointer("/selectionRange/start/line")
         .or_else(|| value.pointer("/range/start/line"))
@@ -527,7 +569,7 @@ fn parse_symbol_information(value: &Value) -> Option<SymbolNode> {
         .get("kind")
         .and_then(Value::as_u64)
         .map(SymbolKind::from_lsp)
-        .unwrap_or(SymbolKind::Lsp(0));
+        .unwrap_or(SymbolKind::from_lsp(0));
     let line = value
         .pointer("/location/range/start/line")
         .and_then(Value::as_u64)
@@ -644,6 +686,41 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn wait_or_kill_returns_for_process_that_exits_on_its_own() {
+        // A process that exits immediately should be reaped well within the
+        // timeout, with no kill needed.
+        let mut child = Command::new("true").spawn().expect("spawn true");
+        let start = Instant::now();
+        wait_or_kill(&mut child, Duration::from_secs(5));
+        assert!(start.elapsed() < Duration::from_secs(2), "should not block");
+        // Already reaped: a second try_wait reports the cached exit status.
+        assert!(matches!(child.try_wait(), Ok(Some(_))));
+    }
+
+    #[test]
+    fn wait_or_kill_kills_a_process_that_never_exits() {
+        // `sleep 600` stands in for a server that ignores `exit`. wait_or_kill
+        // must give up after the timeout and force it down rather than hang.
+        let mut child = Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawn sleep");
+        let start = Instant::now();
+        wait_or_kill(&mut child, Duration::from_millis(100));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "should have waited for the timeout"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "should not block far past the timeout (was {elapsed:?})"
+        );
+        // The process is gone and reaped.
+        assert!(matches!(child.try_wait(), Ok(Some(_))));
+    }
+
+    #[test]
     fn parses_hierarchical_document_symbols() {
         let symbols = parse_symbols(&json!([
             {
@@ -664,7 +741,7 @@ mod tests {
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "Parser");
-        assert_eq!(symbols[0].kind, SymbolKind::Lsp(23));
+        assert_eq!(symbols[0].kind, SymbolKind::from_lsp(23));
         assert_eq!(symbols[0].line, Some(5));
         assert_eq!(symbols[0].detail.as_deref(), Some("struct Parser"));
         assert_eq!(symbols[0].children[0].name, "parse");
@@ -687,7 +764,7 @@ mod tests {
 
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "run");
-        assert_eq!(symbols[0].kind, SymbolKind::Lsp(12));
+        assert_eq!(symbols[0].kind, SymbolKind::from_lsp(12));
         assert_eq!(symbols[0].line, Some(13));
         assert_eq!(symbols[0].detail.as_deref(), Some("in app"));
     }
